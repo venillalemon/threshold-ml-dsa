@@ -3,12 +3,12 @@
 // The world in FRONT of the GC: authenticated additive shares over F_Q
 // (AuthShare = a value share of x plus a MAC share of α·x under a global key α),
 // the transport opens that reconstruct them, and the SPDZ MACCheck that gates a
-// public c.  The dealer stubs (arith_split / auth_split) FAKE F_edabits + the
-// SPDZ dealer from a shared seed — replace them (and the r-open cheat in main)
-// with your real F_edabits / SPDZ engine; keep the opens and the MACCheck.
+// public c.  FakeDealer (bottom of this file) FAKES the SPDZ offline from a
+// shared seed — replace it (and the r-open cheat in edabits.h) with a real
+// SPDZ engine; keep the opens and the MACCheck.
 //
-// Templated on party count nP: deduced from NetIOMP<nP> for the opens / MACCheck;
-// pass explicitly to the dealer stubs, e.g. arith_split<nP>(rng, v).
+// Templated on party count nP: deduced from NetIOMP<nP> for the opens /
+// MACCheck; FakeDealer<nP> carries it as a class template parameter.
 #ifndef MLDSA_SPDZ_H
 #define MLDSA_SPDZ_H
 
@@ -134,31 +134,7 @@ inline void spdz_maccheck(NetIOMP<nP>& io, int party, uint32_t my_alpha,
   expecting(sum == 0, "SPDZ MACCheck failed: opened c is not authenticated (alpha*c != sum mac)");
 }
 
-// ==== DEMO edaBit / SPDZ dealer (replace with F_edabits / real SPDZ) =========
-// Deterministic splits from a shared seed: every party COMPUTES the whole split
-// but only ever USES its own slot [party] — the visibility a real ⟨·⟩ share gives.
-// NOT how real secret sharing works; a self-consistent, checkable stand-in.
-template <int nP> inline std::array<uint32_t, nP + 1> arith_split(std::mt19937& rng, uint32_t v) {
-  std::array<uint32_t, nP + 1> s{};
-  uint32_t acc = 0;
-  for (int p = 1; p < nP; ++p) {
-    s[p] = rng() % Q;
-    acc = fq_add(acc, s[p]);
-  }
-  s[nP] = fq_sub(v, acc); // last share absorbs the rest
-  return s;
-}
-// SPDZ authenticated split: value shares sum to v, MAC shares sum to α·v.
-template <int nP>
-inline std::array<AuthShare, nP + 1> auth_split(std::mt19937& rng, uint32_t v, uint32_t alpha) {
-  const auto vs = arith_split<nP>(rng, v);                // Σ = v
-  const auto ms = arith_split<nP>(rng, fq_mul(alpha, v)); // Σ = α·v
-  std::array<AuthShare, nP + 1> s{};
-  for (int p = 1; p <= nP; ++p)
-    s[p] = {vs[p], ms[p]};
-  return s;
-}
-
+// ==== DEMO SPDZ dealer (replace with a real offline: MASCOT / Overdrive) ====
 // The ONLY holder of the full MAC key. In real SPDZ the full alpha never
 // exists: each party samples its own alpha_p locally (alpha = Σ alpha_p is
 // never reconstructed), and a MAC share of alpha*x is assembled from the
@@ -167,6 +143,11 @@ inline std::array<AuthShare, nP + 1> auth_split(std::mt19937& rng, uint32_t v, u
 // Replacing this struct with such an offline is the SPDZ de-cheat: protocol
 // code only ever touches dealer.my_alpha and dealer.deal(v), both of which a
 // real offline can serve without the `alpha` field existing.
+//
+// The fake works by determinism, not secrecy: every party runs the IDENTICAL
+// seeded rng, COMPUTES the whole split, and only ever USES its own slot
+// [party] — the visibility a real ⟨·⟩ share would give. NOT how real secret
+// sharing works; a self-consistent, checkable stand-in.
 template <int nP> struct FakeDealer {
   int party;
   std::mt19937 rng;  // shared seed: every party runs the identical stream
@@ -175,10 +156,29 @@ template <int nP> struct FakeDealer {
 
   FakeDealer(int party, uint32_t seed) : party(party), rng(seed) {
     alpha = rng() % Q;
-    my_alpha = arith_split<nP>(rng, alpha)[party];
+    my_alpha = arith_split(alpha)[party];
   }
-  // This party's authenticated share of a dealer-chosen value v.
-  AuthShare deal(uint32_t v) { return auth_split<nP>(rng, v, alpha)[party]; }
+
+  // This party's authenticated share of a dealer-chosen value v:
+  // value shares sum to v, MAC shares sum to alpha*v.
+  AuthShare deal(uint32_t v) {
+    const auto vs = arith_split(v);              // Σ = v
+    const auto ms = arith_split(fq_mul(alpha, v)); // Σ = α·v
+    return {vs[party], ms[party]};
+  }
+
+private:
+  // Additive split of v over F_Q; slot p is party p's share.
+  std::array<uint32_t, nP + 1> arith_split(uint32_t v) {
+    std::array<uint32_t, nP + 1> s{};
+    uint32_t acc = 0;
+    for (int p = 1; p < nP; ++p) {
+      s[p] = rng() % Q;
+      acc = fq_add(acc, s[p]);
+    }
+    s[nP] = fq_sub(v, acc); // last share absorbs the rest
+    return s;
+  }
 };
 
 } // namespace mldsa
