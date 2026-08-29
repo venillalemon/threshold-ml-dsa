@@ -1,0 +1,22 @@
+#!/bin/bash
+# runN <nP> <binary> [args...] — an nP-party AG-MPC run on localhost. Parties
+# 1..nP-1 start staggered in the background; party nP runs in the foreground.
+# The exit code is the OR of ALL parties' codes (the correctness verdict lives at
+# party 1, always backgrounded, so a background failure MUST propagate). Base port
+# travels via EMP_PORT (default 12345); NetIOMP binds port+party per peer.
+# (Local copy of emp-ag/runN — the emp libs are installed to /usr/local, so their
+# source trees, and this launcher, are no longer in the workspace.)
+nP="$1"; bin="$2"; shift 2
+export EMP_PORT="${EMP_PORT:-12345}"
+export EMP_N=$nP
+pids=()
+for p in $(seq 1 $((nP - 1))); do
+  (sleep "0.$(printf '%02d' $(( (nP - p) * 5 )))"; "$bin" "$p" "$@") &
+  pids+=($!)
+done
+"$bin" "$nP" "$@"
+rc=$?
+for pid in "${pids[@]}"; do
+  wait "$pid" || rc=1
+done
+exit $rc

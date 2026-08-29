@@ -1,0 +1,313 @@
+% Correctness of the boolean Decompose circuit used in Pi_PrepSign, step 4.
+% Standalone; the body is written so it can be dropped into an appendix
+% (delete the preamble and the \begin{document}/\end{document}).
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{xcolor}
+\usepackage[colorlinks,linkcolor=blue!60!black]{hyperref}
+
+\theoremstyle{plain}
+\newtheorem{lemma}{Lemma}
+\newtheorem{theorem}{Theorem}
+\newtheorem{corollary}{Corollary}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+\newcommand{\Hi}{R_{\mathsf{hi}}}
+\newcommand{\Lo}{R_{\mathsf{lo}}}
+\newcommand{\sgn}{\mathsf{sp}}
+
+\title{Correctness of the boolean \textsf{Decompose} circuit\\
+\large ML-DSA, $\gamma_2=(q-1)/32$: $43$ AND gates per coefficient}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-3em}
+
+\section{Setting}
+
+Throughout, $q=8380417$ and
+\[
+  \gamma_2=\frac{q-1}{32}=261888,\qquad
+  \alpha=2\gamma_2=523776=2^{9}\cdot 1023,\qquad
+  16\alpha=q-1 .
+\]
+The input is an integer $r\in[0,2^{23})$ held as $23$ boolean-shared bits
+$r[0..22]$ (little endian). Step~4 of $\Pi_{\mathsf{PrepSign}}$ must output
+$w_1=\mathsf{HighBits}(r)$ in the clear and keep $w_0=\mathsf{LowBits}(r)$
+shared, where $(w_1,w_0)=\mathsf{Decompose}_q(r,\alpha)$ is the FIPS~204
+routine.
+
+The circuit is stated in terms of the following slices of $r$, all of which are
+free (pure rewiring):
+\[
+  L=r\bmod 2^{9}=r[0..8],\qquad
+  \Lo=r[9..18],\qquad
+  \Hi=\big\lfloor r/2^{19}\big\rfloor=r[19..22]\in[0,16).
+\]
+We write $\rho=\lfloor r/2^{9}\rfloor$, so that
+$r=2^{9}\rho+L$ and $\rho=1024\,\Hi+\Lo$.
+
+\section{Removing the FIPS branch}
+
+FIPS~204 defines $\mathsf{Decompose}$ by cases. We first replace it by a single
+floor function plus one correction bit.
+
+\begin{lemma}[centred quotient]\label{lem:floor}
+Let $r_1^{*}$ be the unique integer with
+$r_0^{*}:=r-\alpha r_1^{*}\in(-\alpha/2,\;\alpha/2]$. Then
+\[
+  r_1^{*}=\left\lfloor\frac{r+\alpha/2-1}{\alpha}\right\rfloor .
+\]
+\end{lemma}
+
+\begin{proof}
+$-\alpha/2<r-\alpha r_1\le\alpha/2$ is equivalent to
+$\frac{r-\alpha/2}{\alpha}\le r_1<\frac{r+\alpha/2}{\alpha}$, whose unique
+integer solution is
+$r_1^{*}=\big\lceil (r-\alpha/2)/\alpha\big\rceil
+       =\big\lfloor (r+\alpha/2-1)/\alpha\big\rfloor$.
+\end{proof}
+
+The offset is $\alpha/2-1$, not $\alpha/2$: the interval is half-open on the
+left, so $r=\alpha/2$ must give $r_1^{*}=0$ rather than $1$.
+
+\begin{lemma}[the branch is a mask and a decrement]\label{lem:branch}
+For $r\in[0,q)$ one has $r_1^{*}\in[0,16]$, and the FIPS~204 output
+$(r_1,r_0)$ satisfies
+\[
+  r_1=r_1^{*}\bmod 16,\qquad
+  r_0=r_0^{*}-\sgn,\qquad
+  \sgn:=\big[\,r_1^{*}=16\,\big].
+\]
+\end{lemma}
+
+\begin{proof}
+FIPS~204 returns $(r_1^{*},r_0^{*})$ unless $r-r_0^{*}=q-1$, in which case it
+returns $(0,\,r_0^{*}-1)$. Since $r-r_0^{*}=\alpha r_1^{*}$ and
+$16\alpha=q-1$, that condition is exactly $r_1^{*}=16$; and
+$16\bmod 16=0$.
+\end{proof}
+
+Lemma~\ref{lem:branch} is what makes the circuit cheap: the data-dependent
+branch has become a truncation (free) plus a single bit $\sgn$.
+
+\section{Dividing by $\alpha=2^{9}\cdot 1023$}
+
+\begin{lemma}[splitting off $2^{9}$]\label{lem:split}
+Let $g=[\,L\ge 257\,]$. Then
+$\displaystyle r_1^{*}=\left\lfloor\frac{\rho+511+g}{1023}\right\rfloor$.
+\end{lemma}
+
+\begin{proof}
+Since $\alpha/2-1=261887=511\cdot 512+255$,
+\[
+  r+\alpha/2-1=512\,(\rho+511)+(L+255),
+  \qquad\text{hence}\qquad
+  \frac{r+\alpha/2-1}{\alpha}=\frac{\rho+511+\frac{L+255}{512}}{1023}.
+\]
+Write $\frac{L+255}{512}=g+f$ with
+$g=\big\lfloor\frac{L+255}{512}\big\rfloor=[\,L\ge257\,]$ and $f\in[0,1)$.
+For an integer $A$, an integer $M\ge1$ and $f\in[0,1)$ we have
+$\lfloor (A+f)/M\rfloor=\lfloor A/M\rfloor$: if $kM\le A+f<A+1$ then $kM\le A$,
+so the two floors bound each other. Apply this with $A=\rho+511+g$ and
+$M=1023$.
+\end{proof}
+
+The rounding offset never becomes an addition: $\alpha/2-1$ splits into $511$
+(absorbed into the dividend) and $255$ (which turns into the threshold
+$L\ge257$), and a threshold is a choice of wire.
+
+\begin{lemma}[casting out nines; \textsf{HighBits}]\label{lem:fold}
+Let $n:=\Lo+\Hi+g$ and $h:=[\,n\ge512\,]$. Then $r_1^{*}=\Hi+h$.
+\end{lemma}
+
+\begin{proof}
+Because $1024=1023+1$,
+$\rho=1024\Hi+\Lo=1023\,\Hi+(\Hi+\Lo)$, so Lemma~\ref{lem:split} gives
+\[
+  r_1^{*}=\Hi+\left\lfloor\frac{\Hi+\Lo+g+511}{1023}\right\rfloor
+        =\Hi+\left\lfloor\frac{n+511}{1023}\right\rfloor .
+\]
+Now $0\le n\le 1023+15+1=1039$, hence $511\le n+511\le 1550<2046=2\cdot1023$:
+the quotient is $0$ or $1$, and it is $1$ iff $n+511\ge1023$, i.e.\ iff
+$n\ge512$.
+\end{proof}
+
+\begin{remark}
+$n\le1039<1536$, so $n_{10}=1$ forces $n\in[1024,1039]$ and $n_9=0$. The two
+bits are disjoint and $h=n_9\vee n_{10}=n_9\oplus n_{10}$ is free under
+free-XOR.
+\end{remark}
+
+\section{\textsf{LowBits} from the same intermediates}
+
+The naive route computes $r_0^{*}=r-\alpha r_1^{*}$ with a constant multiply and
+a $23$-bit subtraction. It is unnecessary: $r_0^{*}$ is already present in the
+quantities Lemma~\ref{lem:fold} produced.
+
+\begin{theorem}\label{thm:low}
+$\displaystyle r_0^{*}=512\,\big(n-g-1023\,h\big)+L .$
+\end{theorem}
+
+\begin{proof}
+Using $\Hi+\Lo=n-g$ and $\rho=1023\Hi+(\Hi+\Lo)$,
+\[
+\begin{aligned}
+  r_0^{*}=r-\alpha r_1^{*}
+  &=512\rho+L-512\cdot1023\,(\Hi+h)\\
+  &=512\Big[\big(1023\Hi+(\Hi+\Lo)\big)-1023\Hi-1023h\Big]+L\\
+  &=512\big[(n-g)-1023h\big]+L. \qedhere
+\end{aligned}
+\]
+\end{proof}
+
+Write $m:=n-g-1023h$, so that $r_0^{*}=512m+L$.
+
+\begin{lemma}[range]\label{lem:range}
+$m\in[-512,511]$, which is exactly the range of a $10$-bit two's complement
+word.
+\end{lemma}
+
+\begin{proof}
+If $h=0$ then $n\le511$ and $m=n-g=\Hi+\Lo\ge0$, so $m\in[0,511]$.
+If $h=1$ then $512\le n\le1039$ and
+$m=n-g-1023\in[512-1-1023,\;1039-0-1023]=[-512,16]$.
+\end{proof}
+
+Consequently $r_0^{*}=512m+L$ with $L\in[0,512)$ is precisely the $19$-bit
+two's complement word $m\,\Vert\,L$, by the standard fact that a $k$-bit two's
+complement high word concatenated with a $j$-bit unsigned low word denotes
+$2^{j}m+L$ in $(k+j)$-bit two's complement. (Consistency check:
+$r_0^{*}\in(-\gamma_2,\gamma_2]\subset[-2^{18},2^{18})$.)
+
+\begin{corollary}[the $1023$ disappears]\label{cor:1023}
+Only $m\bmod 2^{10}$ is needed, and $-1023\equiv1\pmod{1024}$, so
+\[
+  m\;\equiv\;n-g+h \pmod{1024}.
+\]
+\end{corollary}
+
+The multiplication by $1023$ therefore never happens, and only the low ten bits
+of $n$ are used.
+
+\section{Paying for the branch}
+
+By Lemma~\ref{lem:branch}, $r_1=(\Hi+h)\bmod16$: the $4$-bit incrementer simply
+does not compute the carry out of bit~$3$, which is why \textsf{HighBits} alone
+gets the special case for free. That discarded carry is
+\[
+  \sgn=\big[\Hi+h=16\big]=\Hi[0]\wedge \Hi[1]\wedge \Hi[2]\wedge \Hi[3]\wedge h,
+\]
+the last link of the same carry chain: keeping it costs one AND gate.
+
+\begin{lemma}[re-normalising the $-1$]\label{lem:borrow}
+Let $b:=[\,L<\sgn\,]=\sgn\wedge[\,L=0\,]$ and $L':=(L-\sgn)\bmod 512$. Then
+\[
+  r_0=r_0^{*}-\sgn=512\,(m-b)+L',\qquad m-b\in[-512,511].
+\]
+\end{lemma}
+
+\begin{proof}
+The identity is the definition of $b$ and $L'$, since
+$L-\sgn=-512b+L'$. For the range it suffices to rule out $m=-512$ when $b=1$.
+Now $b=1$ forces $\sgn=1$, hence $h=1$ and $\Hi=15$; it also forces $L=0$,
+hence $g=[\,0\ge257\,]=0$. Therefore $n=\Lo+15$, and $n\ge512$ gives
+$\Lo\ge497$, so $m=\Lo+15-1023\ge-511$.
+\end{proof}
+
+In the circuit $b$ and $L'$ come from the borrow chain
+$b_0=\sgn$, $b_{i+1}=b_i\wedge\neg L_i$, $L'_i=L_i\oplus b_i$, whose output
+$b_9=\sgn\wedge\neg L_0\wedge\cdots\wedge\neg L_8=\sgn\wedge[\,L=0\,]$ is the
+claimed $b$.
+
+\begin{lemma}[the three $\pm1$ corrections fuse]\label{lem:s}
+By Corollary~\ref{cor:1023} and Lemma~\ref{lem:borrow},
+$m-b\equiv n+s \pmod{1024}$ with $s:=h-g-b\in[-2,1]$. The $2$-bit two's
+complement encoding $(s_1,s_0)$ of $s$, i.e.\ $s=-2s_1+s_0$, is
+\[
+  s_0=h\oplus g\oplus b,\qquad
+  s_1=[\,s<0\,]=
+  \begin{cases} g\wedge b, & h=1,\\ g\vee b, & h=0,\end{cases}
+  \qquad\text{i.e.}\quad
+  s_1=(g\vee b)\oplus\big(h\wedge\big((g\vee b)\oplus(g\wedge b)\big)\big).
+\]
+\end{lemma}
+
+\begin{proof}
+Exhaustively, $s=1,0,-1,-2$ encode as $(0,1),(0,0),(1,1),(1,0)$ and
+$-2s_1+s_0$ returns $1,0,-1,-2$. The bit $s_0$ is the parity of $h+g+b$. For
+$s_1$: if $h=0$ then $s=-(g+b)<0$ iff $g\vee b$; if $h=1$ then $s=1-g-b<0$ iff
+$g\wedge b$.
+\end{proof}
+
+Sign-extending $(s_1,s_0)$ to ten bits (repeat $s_1$ in bits $1..9$) and adding
+it to $n$ with a ripple chain whose final carry is dropped realises
+$m-b \bmod 2^{10}$, which by Lemma~\ref{lem:range} is $m-b$ itself.
+
+\paragraph{Gate count.}
+$g$: $8$; $n$: $10$; $h$: $0$; $w_1$ and $\sgn$: $4$; the borrow chain for
+$L'$: $9$; $s$: $3$; the $10$-bit add: $9$. Total $43$ AND gates, against $21$
+for \textsf{HighBits} alone. Exhaustively verified against FIPS~204 for every
+$r\in[0,q)$.
+
+\section{Why $\sgn$ must not be revealed}
+
+Revealing $\sgn$ would save the ten gates of Lemma~\ref{lem:borrow} and
+Lemma~\ref{lem:s}, because $w_0=w-\alpha w_1-\sgn$ is then an affine function of
+$w$ with public coefficients and can be computed locally on arithmetic shares.
+It is exactly the one bit that may not be leaked.
+
+\begin{lemma}
+Conditioned on the public value $w_1=0$, we have $\sgn=[\,w_0<0\,]$.
+\end{lemma}
+
+\begin{proof}
+By Lemma~\ref{lem:branch}, $w_1=0$ holds iff $r_1^{*}\in\{0,16\}$. If
+$r_1^{*}=0$ then $w_0=r\in[0,\gamma_2]$ and $\sgn=0$. If $r_1^{*}=16$ then
+$w_0=r-(q-1)-1\in[-\gamma_2,-1]$ and $\sgn=1$.
+\end{proof}
+
+$\mathcal{F}_{\mathsf{PrepSign}}$ outputs $w_1$ in the clear and $w_0$ only in
+shared form. Publishing $\sgn$ would additionally output
+$\mathrm{sign}(w_0)$, a nontrivial predicate of $w=\mathbf{A}\mathbf{y}+
+\mathbf{e}_w$ and hence of the secret nonce $\mathbf{y}$; no simulator given
+$w_1$ alone can produce it.
+
+\section{ML-DSA-44}
+
+Here $\alpha=190464=2^{11}\cdot93$, $\gamma_2=95232$, $44\alpha=q-1$ and
+$\alpha/2-1=95231=46\cdot2048+1023$. With $L=r\bmod 2^{11}$ and
+$\rho=\lfloor r/2^{11}\rfloor$, the arguments of Lemmas~\ref{lem:split}
+and~\ref{lem:fold} give
+\[
+  g=[\,L\ge1025\,],\qquad t=\rho+46+g,\qquad r_1^{*}=\lfloor t/93\rfloor .
+\]
+$93$ is not a Mersenne number, but $11\cdot93=1023$, so identically
+$\lfloor t/93\rfloor=\lfloor 11t/1023\rfloor$. Writing $u=11t=1024a+b$ with
+$b=u\bmod1024$, the same fold $u=1023a+(a+b)$ together with
+$a+b\le44+1023<2\cdot1023$ yields
+\[
+  r_1^{*}=a+h,\qquad h=[\,a+b\ge1023\,].
+\]
+
+The gift of Theorem~\ref{thm:low} does not survive the pre-multiplication by
+$11$: one finds $\rho-93r_1^{*}=\frac{a+b-1023h-506}{11}-g$, and the exact
+division by $11$ is more expensive than recomputing. So the circuit evaluates
+$r_0$ directly,
+\[
+  r_0=r-2^{11}\cdot\big(93\,r_1^{*}\big)-f,\qquad f=[\,r_1^{*}=44\,],
+\]
+using $93x=31\cdot(3x)=32(3x)-(3x)$. Since $|r_0|\le\gamma_2<2^{17}$, the result
+is an $18$-bit two's complement word --- a $7$-bit high word above the $11$ bits
+of $L'$ --- so $93r_1^{*}$ is only ever needed modulo $2^{7}$; truncation is
+legitimate because reduction mod $2^{7}$ is a ring homomorphism and the top
+carry is discarded anyway. Finally $-D-b=\neg D+\neg b$ for a bit $b$ (as
+$\neg D=2^{7}-1-D$ and $1-b=\neg b$), so the borrow enters as the carry-in of a
+single ripple add. The cost is $71+29=100$ AND gates, again exhaustively
+verified over $r\in[0,q)$.
+
+\end{document}
