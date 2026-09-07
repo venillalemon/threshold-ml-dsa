@@ -37,6 +37,11 @@ inline AuthShare operator+(const AuthShare& a, const AuthShare& b) {
 inline AuthShare operator*(const AuthShare& x, uint32_t c) {
   return {fq_mul(x.val, c), fq_mul(x.mac, c)};
 }
+// x + k for public k: party 1 carries k in the value share; every party adds
+// its alpha-share times k to the MAC share (sum over parties = alpha*k).
+inline AuthShare add_public(const AuthShare& x, uint32_t k, int party, uint32_t my_alpha) {
+  return {party == 1 ? fq_add(x.val, k) : x.val, fq_add(x.mac, fq_mul(my_alpha, k))};
+}
 
 // ---- public matrix x shared vector over R_q --------------------------------
 // acc += A * x in R_q^rows with R_q = F_Q[X]/(X^N+1); A is a public rows x cols

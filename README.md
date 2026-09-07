@@ -106,9 +106,16 @@ make clean
 ```
   pk: rho[0]=9e3779b9, t1=1536 coefficients | tr[0]=...
   signature: (c, z, h) — ||z||_inf=523576 (< 524092), HW(h)=45 (<= 55)
-  setup 13 ms | KeyGen 314 ms | Sign 2538 ms | ANDs garbled 1446612
+  setup     14.2 ms | comm    0.2 MB
+  KeyGen   343.6 ms | comm    7.0 MB | ANDs 17424
+  Sign    2021.6 ms | comm  350.3 MB | ANDs 1454736
+STATS np=3 param=ML-DSA-65 ...
   KeyGen + Sign complete
 ```
+
+时间/AND 数/通信量都按阶段拆分(通信量是本方发+收的字节数);`STATS` 行是
+同一组数字的机器可读版,供基准脚本 grep。被拒绝的运行 Sign 开销更小
+(r₀ 拒绝后跳过 z 电路,AND 数约为接受运行的 60%)。
 
 TEST=1 会额外打印每步自检:KeyGen 的 t = A·s+e 明文比对与 Power2Round 恒等式、
 PrepSign 的 Decompose 对 FIPS oracle、Sign 的 r₀/z 电路对明文逐位比对,

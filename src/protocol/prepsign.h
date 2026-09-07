@@ -23,10 +23,10 @@ namespace mldsa {
 inline std::vector<uint32_t> test_opened_y, test_opened_w;
 #endif
 
-// PrepSign outputs. w0_2 remains a vector of secret AG circuit values so it can
-// be consumed directly by the next circuit. y_2 is the authenticated Boolean
-// sharing returned by y_edabits (the 20-bit two's-complement encoding of y-1).
-// w1 is public at every party.
+// PrepSign outputs: <y>_q and <w>_q (SPDZ arithmetic shares -- Sign's online
+// part only needs the linear maps z = y + c*s and w0 - c*e, which are local on
+// these), and the public w1. The Boolean <w0>_2 from Decompose is not exported:
+// w0 = w - w1*2*gamma2 mod q is recomputed linearly from <w>_q.
 template <int nP> using PrepSignCtx = typename emp::AGMPCSession<nP>::ctx_t;
 
 // A is the public matrix ExpandA(rho) from KeyGen (keygen.h), flattened
@@ -34,9 +34,8 @@ template <int nP> using PrepSignCtx = typename emp::AGMPCSession<nP>::ctx_t;
 // caller passes KeyPair::A.
 template <int nP>
 inline void prepsign(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& dealer,
-                     const std::vector<uint32_t>& A,
-                     std::vector<emp::UInt_T<PrepSignCtx<nP>, OW0>>& w0_2,
-                     emp::ag::AShareBundleVec<nP>& y_2, std::vector<uint32_t>& w1) {
+                     const std::vector<uint32_t>& A, std::vector<AuthShare>& y_q,
+                     std::vector<AuthShare>& w_q, std::vector<uint32_t>& w1) {
   using Ctx = PrepSignCtx<nP>;
   using U23 = emp::UInt_T<Ctx, L>;
 
@@ -128,11 +127,19 @@ inline void prepsign(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& dea
   timer_lap("decompose circuit");
 #endif
 
+  // One batched reveal for all of w1 (one decode round, not COEFF_COUNT).
+  using W1V = emp::BitVec_T<Ctx, COEFF_COUNT * OW1>;
+  std::vector<typename Ctx::Wire> w1w((size_t)COEFF_COUNT * OW1);
+  for (int i = 0; i < COEFF_COUNT; ++i)
+    w1_wires[(size_t)i].pack_wires(&w1w[(size_t)i * OW1]);
+  const auto public_w1 = sess.reveal(W1V::from_wires(sess.ctx(), w1w.data()), emp::PUBLIC);
+  emp::expecting(public_w1.has_value(), "PrepSign: public w1 reveal failed");
   w1.resize(COEFF_COUNT);
   for (int i = 0; i < COEFF_COUNT; ++i) {
-    const auto public_w1 = sess.reveal(w1_wires[i], emp::PUBLIC);
-    emp::expecting(public_w1.has_value(), "PrepSign: public w1 reveal failed");
-    w1[i] = (uint32_t)public_w1.value();
+    uint32_t v = 0;
+    for (int k = 0; k < OW1; ++k)
+      v |= (uint32_t)public_w1.value()[(size_t)i * OW1 + k] << k;
+    w1[i] = v;
   }
 #ifdef TEST
   timer_lap("w1 reveal");
@@ -168,8 +175,8 @@ inline void prepsign(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& dea
   timer_lap("test w0/w1 oracle");
 #endif
 
-  w0_2 = std::move(w0_wires);
-  y_2 = std::move(y.two_share);
+  y_q = std::move(y.q_share);
+  w_q = std::move(w_share);
 }
 
 } // namespace mldsa

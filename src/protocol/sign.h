@@ -1,28 +1,41 @@
-// src/protocol/sign.h — Pi_MLDSA Sign, single-shot variant (T = 1).
+// src/protocol/sign.h — Pi_MLDSA Sign, single-shot variant (T = 1), online-minimal.
 //
-// Paper steps -> code, same order, no repetition:
-//   1a. F_PrepSign                              prepsign() (same session)
+// Paper steps -> code:
+//   1a. F_PrepSign                              prepsign()            [offline]
+//   1a'. edaBit masks for z and r0; garble      Fq_edabits + sess.prepare()
+//        the online circuit                                            [offline]
 //   1b. mu = H(tr,m), c = H(mu,w1)              h256_stub + sample_in_ball_stub (CHEAT)
-//   1c. <r0>_2 = <w0>_2 - c<e>_2,               Boolean circuit: c*e adder trees,
-//       reveal [||r0||_inf < g2 - beta] only    one aggregated public bit
+//   1c+3. <z>_q = <y>_q + c<s>_q,               LOCAL (linear on SPDZ shares)
+//         <d>_q = <w>_q - w1*2g2 - c<e>_q       LOCAL (= w0 - c*e, see below)
+//         open z + r_z, d + r_d                 ONE all-to-all open + MACCheck
+//         circuit: z = (cz - r_z) mod q,        ONE prepared circuit run:
+//         d = (cd - r_d) mod q, both norm        output = (accept, accept ? z : 0)
+//         predicates -> accept, z via MUX        ONE batched reveal
 //       -> on reject return (c, bot, bot)
-//   3.  z = y + c*s, ||z||_inf < g1 - beta      Boolean circuit (T=1: no index
-//       -> on reject return (c, bot, bot)       selection), then open z publicly
 //   4.  h = MakeHint(-c t0, Az - ct + c t0)     local on public values
 //   5.  ||c t0||_inf >= g2 or HW(h) > omega     -> (c, z, bot), else (c, z, h)
 //
-// c*<e>_2 and c*<s>_2 exploit that c has TAU coefficients in {-1,+1}: each output
-// coefficient is a signed sum of TAU (negacyclically indexed, possibly negated)
-// small shares — ripple adder trees at CE_WIDTH bits, no general multiplier.
-// Prefix sums stay in [-BETA, BETA] (m terms are bounded by m*ETA <= TAU*ETA).
+// c never touches a Boolean circuit: c*s and c*e are computed on the SPDZ
+// arithmetic shares (free), and w0 - c*e is obtained as <w>_q - w1*2*gamma2 -
+// c<e>_q, which equals FIPS Decompose's w0 minus c*e mod q (the identity
+// w = w1*2g2 + w0 holds mod q including the top-of-range corner). Only the
+// two range predicates are non-linear; they run on a CHALLENGE-INDEPENDENT
+// prepared circuit whose inputs are the edaBit masks (soldered) and the two
+// masked openings (public). Online rounds: open (1) + MACCheck (1) +
+// run(prepared) (~4) + reveal (1). Both predicates fold into one accept bit
+// and z is released through MUX(accept, z, 0), so a rejected run reveals
+// nothing but the bit.
 #ifndef MLDSA_SIGN_H
 #define MLDSA_SIGN_H
 
 #include "circuit.h"
+#include "edabits.h"
 #include "keygen.h"
 #include "prepsign.h"
 #include "ref.h"
+#include "spdz.h"
 #include <emp-ag/emp-ag.h>
+#include <emp-tool/circuits/frontend/frontend.h>
 
 #include <array>
 #include <cstdint>
@@ -33,16 +46,14 @@
 
 namespace mldsa {
 
-constexpr int ce_bits(int bound) { // smallest W with |v| <= bound representable signed
-  int w = 2;
-  while ((int64_t(1) << (w - 1)) <= bound)
-    ++w;
-  return w;
-}
-constexpr int CE_WIDTH = ce_bits(BETA); // c*e / c*s accumulator width
-constexpr int Z_WIDTH = 21;             // z = y + c*s, |z| <= GAMMA1 + BETA
-static_assert(GAMMA1 + BETA < (1 << (Z_WIDTH - 1)), "Z_WIDTH too small");
-static_assert(G2 + BETA < (1 << (OW0 - 1)), "w0 - c*e must fit OW0 bits signed");
+constexpr int ZW = Y_COEFF_COUNT * L;  // z / r_z / cz, L-bit mod-q representatives
+constexpr int DW = COEFF_COUNT * L;    // d / r_d / cd
+constexpr int OUTW = 1 + ZW;           // accept || z (mod-q form, gated)
+static_assert(GAMMA1 + BETA < Q / 2 && G2 + BETA < Q / 2, "centered bounds must be < q/2");
+
+template <class Ctx> using ZV = emp::BitVec_T<Ctx, ZW>;
+template <class Ctx> using DV = emp::BitVec_T<Ctx, DW>;
+template <class Ctx> using OUTV = emp::BitVec_T<Ctx, OUTW>;
 
 // (c, z, h) with explicit bot markers: z_ok=false => (c,bot,bot) [r0 or z
 // rejected]; h_ok=false => (c,z,bot). All public — this IS the signature.
@@ -54,72 +65,116 @@ struct Signature {
   std::vector<uint8_t> h; // N*K hint bits (iff h_ok)
 };
 
-// c * <x>_2 for a length-`polys` vector of eta-small polynomials (x = e with
-// polys = K, x = s with polys = ELL). Adopts the EW-bit two's-complement
-// shares into the circuit and returns one CE_WIDTH-bit signed accumulator per
-// coefficient. c is public and sparse with coefficients in {-1,+1}, so output
-// coefficient i of poly p is a signed sum of |c_nz| negacyclically indexed,
-// possibly negated shares — ripple adder trees, no general multiplier. Every
-// negation is ~x plus the adder carry-in; prefix sums stay within
-// [-BETA, BETA] (m terms are bounded by m*ETA), so CE_WIDTH never overflows.
-template <int nP>
-inline std::vector<std::array<emp::Bit_T<typename emp::AGMPCSession<nP>::ctx_t>, CE_WIDTH>>
-cmul_shared(emp::AGMPCSession<nP>& sess, emp::ag::AShareBundleVec<nP>& x_2,
-            const std::vector<std::pair<int, int>>& c_nz, int polys) {
-  using Ctx = typename emp::AGMPCSession<nP>::ctx_t;
-  using Bit = emp::Bit_T<Ctx>;
-  constexpr int EW = ETA == 2 ? 3 : 4;
+// ---- local SPDZ arithmetic --------------------------------------------------
 
-  std::vector<std::array<Bit, CE_WIDTH>> x_bits((size_t)polys * N);
-  for (int i = 0; i < polys * N; ++i) {
-    auto xi =
-        sess.template adopt_authenticated_input<emp::UInt_T<Ctx, EW>>(&x_2[(size_t)EW * i]);
-    for (int k = 0; k < EW; ++k)
-      x_bits[i][k] = xi[k];
-    for (int k = EW; k < CE_WIDTH; ++k)
-      x_bits[i][k] = xi[EW - 1]; // sign extend, free
-  }
-
-  std::vector<std::array<Bit, CE_WIDTH>> out((size_t)polys * N);
-  for (int p = 0; p < polys; ++p)
+// acc[N] += c * x over R_q on authenticated shares; c sparse in {-1,0,1}
+// given as (degree, sign) pairs. Purely local (linear).
+inline void cpoly_mul_auth(const std::vector<std::pair<int, int>>& c_nz, const AuthShare* x,
+                           AuthShare* acc) {
+  for (const auto& [deg, sgn0] : c_nz)
     for (int i = 0; i < N; ++i) {
-      Bit* acc = out[(size_t)p * N + i].data();
-      bool first = true;
-      for (const auto& [deg, sgn0] : c_nz) {
-        int d = i - deg, sgn = sgn0;
-        if (d < 0) { // negacyclic wrap: x^N = -1
-          d += N;
-          sgn = -sgn;
-        }
-        const Bit* src = x_bits[(size_t)p * N + d].data();
-        if (first) {
-          if (sgn > 0)
-            for (int k = 0; k < CE_WIDTH; ++k)
-              acc[k] = src[k];
-          else { // -x = ~x + 1
-            Bit inv[CE_WIDTH];
-            for (int k = 0; k < CE_WIDTH; ++k)
-              inv[k] = !src[k];
-            add_const_ripple<CE_WIDTH>(sess.ctx(), acc, inv, 0, true);
-          }
-          first = false;
-        } else {
-          Bit term[CE_WIDTH];
-          for (int k = 0; k < CE_WIDTH; ++k)
-            term[k] = sgn < 0 ? !src[k] : src[k];
-          add_ripple<CE_WIDTH>(sess.ctx(), acc, acc, term, sgn < 0);
-        }
+      int d = i - deg, sgn = sgn0;
+      if (d < 0) { // negacyclic wrap: x^N = -1
+        d += N;
+        sgn = -sgn;
       }
+      acc[i] = acc[i] + (sgn > 0 ? x[d] : x[d] * (uint32_t)(Q - 1));
     }
-  return out;
 }
 
+// ---- the challenge-independent online circuit ------------------------------
+
+// v = (c - r) mod q with c public, r shared, both in [0, q). Two L-bit ripple
+// chains (2L AND): d = c - r + 2^L, then +Q iff borrowed. Q's bits are
+// compile-time constants, so the conditional +Q chain needs no extra AND.
+template <class Ctx>
+inline void sub_modq_bits(Ctx& ctx, Bit_T<Ctx>* v, const Bit_T<Ctx>* c, const Bit_T<Ctx>* r) {
+  using Bit = Bit_T<Ctx>;
+  Bit d[L], carry = Bit::constant(ctx, true);
+  for (int i = 0; i < L; ++i)
+    fa(d[i], carry, c[i], !r[i], carry);
+  const Bit need = !carry; // c < r
+  carry = Bit::constant(ctx, false);
+  for (int i = 0; i < L; ++i) {
+    if (((Q >> i) & 1) != 0)
+      fa(v[i], carry, d[i], need, carry);
+    else
+      ha(v[i], carry, d[i], carry);
+  }
+}
+
+// Strict centered bound |v_centered| < B for v in [0, q): v < B or v > q - B.
+template <class Ctx>
+inline Bit_T<Ctx> in_centered_bound(Ctx& ctx, const Bit_T<Ctx>* v, int64_t B) {
+  return !ge_const_u<L>(ctx, v, (uint64_t)B) | ge_const_u<L>(ctx, v, (uint64_t)(Q - B + 1));
+}
+
+// Output bit 0 is accept; bits 1.. are z (mod-q representatives) gated by accept.
+template <class Ctx>
+inline OUTV<Ctx> online_body(Ctx& ctx, const ZV<Ctx>& rz, const DV<Ctx>& rd, const ZV<Ctx>& cz,
+                             const DV<Ctx>& cd) {
+  using Bit = Bit_T<Ctx>;
+  std::vector<Bit> bad;
+  bad.reserve((size_t)COEFF_COUNT + Y_COEFF_COUNT);
+  std::vector<Bit> zb((size_t)ZW);
+  Bit c[L], r[L], v[L];
+
+  for (int idx = 0; idx < Y_COEFF_COUNT; ++idx) {
+    for (int k = 0; k < L; ++k) {
+      c[k] = cz[idx * L + k];
+      r[k] = rz[idx * L + k];
+    }
+    sub_modq_bits(ctx, v, c, r);
+    bad.push_back(!in_centered_bound(ctx, v, (int64_t)(GAMMA1 - BETA)));
+    for (int k = 0; k < L; ++k)
+      zb[(size_t)(idx * L + k)] = v[k];
+  }
+  for (int idx = 0; idx < COEFF_COUNT; ++idx) {
+    for (int k = 0; k < L; ++k) {
+      c[k] = cd[idx * L + k];
+      r[k] = rd[idx * L + k];
+    }
+    sub_modq_bits(ctx, v, c, r);
+    bad.push_back(!in_centered_bound(ctx, v, (int64_t)(G2 - BETA)));
+  }
+
+  const Bit accept = !or_tree(bad.data(), (int)bad.size());
+  std::vector<Bit> outb((size_t)OUTW);
+  outb[0] = accept;
+  for (int b = 0; b < ZW; ++b)
+    outb[(size_t)(1 + b)] = accept & zb[(size_t)b]; // MUX(accept, z, 0)
+  return OUTV<Ctx>::from_bit_values(ctx, outb.data());
+}
+
+// Compiled once per process: the circuit depends on the parameter set only.
+inline const auto& online_circuit() {
+  using emp::RecordCtx;
+  static const auto c = emp::frontend::compile<ZV<RecordCtx>, DV<RecordCtx>, ZV<RecordCtx>,
+                                               DV<RecordCtx>>(
+      [](RecordCtx& ctx, ZV<RecordCtx> rz, DV<RecordCtx> rd, ZV<RecordCtx> cz, DV<RecordCtx> cd) {
+        return online_body(ctx, rz, rd, cz, cd);
+      });
+  return c;
+}
+
+// No-op default for sign()'s after_prepsign hook (see below).
+struct NoopHook {
+  void operator()() const {}
+};
+
 // ---- Sign -------------------------------------------------------------------
-template <int nP>
+// `after_prepsign` fires once, right after the offline part (F_PrepSign, the
+// edaBit masks and the prepared garbling) and before any message-dependent
+// step -- lets a caller snapshot comm counters at exactly the offline/online
+// boundary. `online_rounds_out`, if non-null, receives the number of online
+// synchronization barriers (open+MACCheck, run(prepared), reveal = 3).
+template <int nP, class Hook = NoopHook>
 inline Signature sign(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& dealer,
-                      KeyPair<nP>& kp, const std::vector<uint32_t>& msg) {
+                      KeyPair<nP>& kp, const std::vector<uint32_t>& msg,
+                      Hook after_prepsign = Hook{}, int64_t* online_rounds_out = nullptr) {
   using Ctx = typename emp::AGMPCSession<nP>::ctx_t;
-  using Bit = emp::Bit_T<Ctx>;
+  using Wire = typename Ctx::Wire;
+  using UL = emp::UInt_T<Ctx, L>;
 
   Signature sig;
 
@@ -132,15 +187,27 @@ inline Signature sign(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& de
   };
 #endif
 
-  // 1a. F_PrepSign -> (<w0>_2 wires, w1 public, <y>_2 shares), T = 1.
-  std::vector<emp::UInt_T<Ctx, OW0>> w0_2;
-  emp::ag::AShareBundleVec<nP> y_2;
+  // ---- offline ---------------------------------------------------------------
+  // 1a. F_PrepSign -> (<y>_q, <w>_q, w1 public), T = 1.
+  std::vector<AuthShare> y_q, w_q;
   std::vector<uint32_t> w1;
-  prepsign<nP>(sess, party, dealer, kp.A, w0_2, y_2, w1);
+  prepsign<nP>(sess, party, dealer, kp.A, y_q, w_q, w1);
 #ifdef TEST
   timer_lap("prepsign");
 #endif
 
+  // 1a'. edaBit masks for the two A2B conversions, then garble the
+  // (challenge-independent) online circuit: OTs, triples, rows and the COT
+  // check all finish before the message exists.
+  SharePair<nP, L, true> rz = Fq_edabits<nP, L>(sess, party, dealer, Y_COEFF_COUNT);
+  SharePair<nP, L, true> rd = Fq_edabits<nP, L>(sess, party, dealer, COEFF_COUNT);
+  auto prepared = sess.prepare(online_circuit());
+#ifdef TEST
+  timer_lap("edabits + prepare");
+#endif
+  after_prepsign(); // offline/online boundary -- everything below needs msg
+
+  // ---- online ----------------------------------------------------------------
   // 1b. mu = H(tr, m), c = H(mu, w1).
   std::vector<uint32_t> mu_in(kp.tr.begin(), kp.tr.end());
   mu_in.insert(mu_in.end(), msg.begin(), msg.end());
@@ -157,92 +224,101 @@ inline Signature sign(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& de
     if (sig.c[j])
       c_nz.push_back({j, sig.c[j]});
 
-  // 1c. <r0>_2 = <w0>_2 - c*<e>_2; reveal only the STRICT predicate
-  // [||r0||_inf < g2 - beta]. |w0 - c*e| <= g2 + beta < 2^(OW0-1), so
-  // d := w0 - c*e is exact at OW0 bits, and the mod± 2g2 reduction never has
-  // to be materialized: any d that would wrap (|d| > g2) reduces to
-  // |r0| >= g2 - beta, which the strict bound rejects anyway. Hence
-  // pass  <=>  -(g2-beta) < d < g2-beta  on the unreduced value.
-  const auto ce = cmul_shared<nP>(sess, kp.e.two_share, c_nz, K);
-  std::vector<Bit> r0_bad;
-  r0_bad.reserve(COEFF_COUNT);
-  for (int idx = 0; idx < COEFF_COUNT; ++idx) {
-    Bit w0b[OW0];
-    unpack_bits<OW0>(w0_2[idx], w0b);
-    Bit nce[OW0]; // -ce sign-extended: ~ce, +1 via the adder carry-in
-    for (int k = 0; k < OW0; ++k)
-      nce[k] = !(k < CE_WIDTH ? ce[idx][k] : ce[idx][CE_WIDTH - 1]);
-    Bit db[OW0];
-    add_ripple<OW0>(sess.ctx(), db, w0b, nce, true); // d = w0 - ce
-    const Bit in_lo = ge_const<OW0>(sess.ctx(), db, -(int64_t)(G2 - BETA) + 1); // d > -(g2-beta)
-    const Bit in_hi = !ge_const<OW0>(sess.ctx(), db, (int64_t)(G2 - BETA));     // d < g2-beta
-    r0_bad.push_back(!(in_lo & in_hi));
+  // 1c+3 (linear part, local): <z>_q = <y>_q + c<s>_q,
+  // <d>_q = <w>_q - w1*2g2 - c<e>_q  (= w0 - c*e mod q).
+  std::vector<AuthShare> z_q = y_q;
+  for (int p = 0; p < ELL; ++p)
+    cpoly_mul_auth(c_nz, &kp.s.q_share[(size_t)p * N], &z_q[(size_t)p * N]);
+  std::vector<AuthShare> d_q = w_q;
+  for (int idx = 0; idx < COEFF_COUNT; ++idx)
+    d_q[(size_t)idx] = add_public(d_q[(size_t)idx],
+                                  modq_i64(-(int64_t)w1[(size_t)idx] * 2 * G2), party,
+                                  dealer.my_alpha);
+  {
+    std::vector<AuthShare> ce((size_t)COEFF_COUNT);
+    for (int p = 0; p < K; ++p)
+      cpoly_mul_auth(c_nz, &kp.e.q_share[(size_t)p * N], &ce[(size_t)p * N]);
+    for (int idx = 0; idx < COEFF_COUNT; ++idx)
+      d_q[(size_t)idx] = d_q[(size_t)idx] + ce[(size_t)idx] * (uint32_t)(Q - 1);
   }
-  const Bit r0_reject = or_tree(r0_bad.data(), (int)r0_bad.size());
+
+  // Mask-and-open (F_A2B step 2): cz = z + r_z, cd = d + r_d, one all-to-all
+  // open for both vectors, one batched MACCheck.
+  std::vector<uint32_t> open_val((size_t)Y_COEFF_COUNT + COEFF_COUNT), open_mac(open_val.size());
+  for (int i = 0; i < Y_COEFF_COUNT; ++i) {
+    const AuthShare m = z_q[(size_t)i] + rz.q_share[(size_t)i];
+    open_val[(size_t)i] = m.val;
+    open_mac[(size_t)i] = m.mac;
+  }
+  for (int i = 0; i < COEFF_COUNT; ++i) {
+    const AuthShare m = d_q[(size_t)i] + rd.q_share[(size_t)i];
+    open_val[(size_t)Y_COEFF_COUNT + i] = m.val;
+    open_mac[(size_t)Y_COEFF_COUNT + i] = m.mac;
+  }
+#ifdef TAMPER_C
+  if (party == 1)
+    open_val[0] ^= 1;
+#endif
+  const std::vector<uint32_t> opened_masked = open_additive_modq(sess.io(), party, open_val);
+  spdz_maccheck(sess.io(), party, dealer.my_alpha, open_mac, opened_masked);
+
+  // Circuit inputs: the masks (soldered) and the openings (public).
+  std::vector<Wire> rzw((size_t)ZW), rdw((size_t)DW);
+  for (int i = 0; i < Y_COEFF_COUNT; ++i)
+    sess.template adopt_authenticated_input<UL>(&rz.two_share[(size_t)L * i])
+        .pack_wires(&rzw[(size_t)i * L]);
+  for (int i = 0; i < COEFF_COUNT; ++i)
+    sess.template adopt_authenticated_input<UL>(&rd.two_share[(size_t)L * i])
+        .pack_wires(&rdw[(size_t)i * L]);
+  const ZV<Ctx> rz_v = ZV<Ctx>::from_wires(sess.ctx(), rzw.data());
+  const DV<Ctx> rd_v = DV<Ctx>::from_wires(sess.ctx(), rdw.data());
+  typename ZV<Ctx>::clear_t czb{};
+  typename DV<Ctx>::clear_t cdb{};
+  for (int i = 0; i < Y_COEFF_COUNT; ++i)
+    for (int k = 0; k < L; ++k)
+      czb[(size_t)(i * L + k)] = ((opened_masked[(size_t)i] >> k) & 1) != 0;
+  for (int i = 0; i < COEFF_COUNT; ++i)
+    for (int k = 0; k < L; ++k)
+      cdb[(size_t)(i * L + k)] = ((opened_masked[(size_t)Y_COEFF_COUNT + i] >> k) & 1) != 0;
+  const ZV<Ctx> cz_v = sess.template input<ZV<Ctx>>(emp::PUBLIC, czb);
+  const DV<Ctx> cd_v = sess.template input<DV<Ctx>>(emp::PUBLIC, cdb);
+
+  // One prepared run, one batched reveal.
+  const OUTV<Ctx> out = sess.run(std::move(prepared), rz_v, rd_v, cz_v, cd_v);
+  const auto opened = sess.reveal(out, emp::PUBLIC);
+  emp::expecting(opened.has_value(), "Sign: online reveal failed");
+  if (online_rounds_out)
+    *online_rounds_out = 3;
 #ifdef TEST
-  // Plaintext oracle: recompute every r0 bad bit from the opened e (keygen)
-  // and w (prepsign) and compare with the circuit bit by bit.
+  timer_lap("open + run + reveal");
+#endif
+
+  const auto& ob = opened.value();
+  const bool accept = ob[0];
+
+#ifdef TEST
+  // Plaintext oracle: recompute r0 / z from the opened e, s (keygen) and w, y
+  // (prepsign); the circuit's accept bit and (if accepted) z must agree.
   const auto centered = [](uint32_t x) {
     return x > (uint32_t)Q / 2 ? (int32_t)x - Q : (int32_t)x;
   };
-  int r0_bad_count = 0, r0_mismatch = 0;
+  bool expect_accept = true;
   for (int p = 0; p < K; ++p) {
     int64_t e_row[N], ce_row[N] = {0};
     for (int i = 0; i < N; ++i)
       e_row[i] = centered(kp.opened_e[p * N + i]);
     cpoly_mul_acc(sig.c, e_row, ce_row);
     for (int i = 0; i < N; ++i) {
-      const int idx = p * N + i;
-      int64_t d = ref_lowbits((int32_t)test_opened_w[idx], G2) - ce_row[i];
-      if (d > G2) // mod± 2g2 into (-g2, g2]
+      int64_t d = ref_lowbits((int32_t)test_opened_w[p * N + i], G2) - ce_row[i];
+      if (d > G2)
         d -= 2 * (int64_t)G2;
       else if (d <= -G2)
         d += 2 * (int64_t)G2;
-      const bool expect_bad = d >= G2 - BETA || d <= -(G2 - BETA); // strict acceptance
-      const bool circuit_bad = (bool)sess.reveal(r0_bad[idx], emp::PUBLIC).value();
-      r0_bad_count += circuit_bad;
-      r0_mismatch += circuit_bad != expect_bad;
+      if (d >= G2 - BETA || d <= -(G2 - BETA))
+        expect_accept = false;
     }
   }
-  if (party == 1)
-    std::printf("  Sign: r0 out-of-range coefficients %d / %d, circuit/plaintext mismatches %d\n",
-                r0_bad_count, COEFF_COUNT, r0_mismatch);
-  emp::expecting(r0_mismatch == 0, "Sign test: r0 circuit disagrees with plaintext");
-  timer_lap("r0 circuit");
-#endif
-  const auto r0_rej = sess.reveal(r0_reject, emp::PUBLIC);
-  emp::expecting(r0_rej.has_value(), "Sign: r0 predicate reveal failed");
-  if (r0_rej.value())
-    return sig; // (c, bot, bot)
-
-  // 3. z = y + c*s with the STRICT check ||z||_inf < g1 - beta; T = 1, so the
-  // "first index j*" selection degenerates to this single check. Open z only
-  // if it passes.
-  const auto cs = cmul_shared<nP>(sess, kp.s.two_share, c_nz, ELL);
-  std::vector<emp::UInt_T<Ctx, Z_WIDTH>> z_wires;
-  z_wires.reserve(Y_COEFF_COUNT);
-  std::vector<Bit> z_bad;
-  z_bad.reserve(Y_COEFF_COUNT);
-  for (int idx = 0; idx < Y_COEFF_COUNT; ++idx) {
-    // <y>_2 stores y-1 (edabits.h affine encoding): z = (y-1) + cs + 1.
-    auto yi = sess.template adopt_authenticated_input<emp::UInt_T<Ctx, Y_WIDTH>>(
-        &y_2[(size_t)Y_WIDTH * idx]);
-    Bit yb[Z_WIDTH], csb[Z_WIDTH], zb[Z_WIDTH];
-    for (int k = 0; k < Z_WIDTH; ++k) {
-      yb[k] = yi[k < Y_WIDTH ? k : Y_WIDTH - 1];
-      csb[k] = cs[idx][k < CE_WIDTH ? k : CE_WIDTH - 1];
-    }
-    add_ripple<Z_WIDTH>(sess.ctx(), zb, yb, csb, true);
-    const Bit ok = ge_const<Z_WIDTH>(sess.ctx(), zb, -(int64_t)(GAMMA1 - BETA) + 1) &
-                   !ge_const<Z_WIDTH>(sess.ctx(), zb, (int64_t)(GAMMA1 - BETA));
-    z_bad.push_back(!ok);
-    z_wires.push_back(pack_bits<Z_WIDTH>(sess.ctx(), zb));
-  }
-  const Bit z_reject = or_tree(z_bad.data(), (int)z_bad.size());
-#ifdef TEST
-  // Plaintext oracle for z = y + c*s, bit-compared like r0 above.
   std::vector<int64_t> z_plain(Y_COEFF_COUNT);
-  int z_bad_count = 0, z_mismatch = 0;
   for (int p = 0; p < ELL; ++p) {
     int64_t s_row[N], cs_row[N] = {0};
     for (int i = 0; i < N; ++i)
@@ -251,38 +327,34 @@ inline Signature sign(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& de
     for (int i = 0; i < N; ++i) {
       const int idx = p * N + i;
       z_plain[idx] = centered(test_opened_y[idx]) + cs_row[i];
-      const bool expect_bad =
-          z_plain[idx] >= GAMMA1 - BETA || z_plain[idx] <= -(GAMMA1 - BETA); // strict acceptance
-      const bool circuit_bad = (bool)sess.reveal(z_bad[idx], emp::PUBLIC).value();
-      z_bad_count += circuit_bad;
-      z_mismatch += circuit_bad != expect_bad;
+      if (z_plain[idx] >= GAMMA1 - BETA || z_plain[idx] <= -(GAMMA1 - BETA))
+        expect_accept = false;
     }
   }
   if (party == 1)
-    std::printf("  Sign: z out-of-range coefficients %d / %d, circuit/plaintext mismatches %d\n",
-                z_bad_count, Y_COEFF_COUNT, z_mismatch);
-  emp::expecting(z_mismatch == 0, "Sign test: z circuit disagrees with plaintext");
-  timer_lap("z circuit");
+    std::printf("  Sign: circuit accept=%d, plaintext accept=%d\n", (int)accept,
+                (int)expect_accept);
+  emp::expecting(accept == expect_accept, "Sign test: accept bit disagrees with plaintext");
+  if (!accept) {
+    for (int b = 1; b < OUTW; ++b)
+      emp::expecting(!ob[(size_t)b], "Sign test: rejected run leaked a nonzero z bit");
+  }
 #endif
-  const auto z_rej = sess.reveal(z_reject, emp::PUBLIC);
-  emp::expecting(z_rej.has_value(), "Sign: z predicate reveal failed");
-  if (z_rej.value())
+
+  if (!accept)
     return sig; // (c, bot, bot)
 
   sig.z.resize(Y_COEFF_COUNT);
   for (int i = 0; i < Y_COEFF_COUNT; ++i) {
-    const auto zi = sess.reveal(z_wires[i], emp::PUBLIC);
-    emp::expecting(zi.has_value(), "Sign: public z reveal failed");
-    const int32_t raw = (int32_t)zi.value();
-    sig.z[i] = raw - ((raw >> (Z_WIDTH - 1)) << Z_WIDTH); // sign extend
+    uint32_t v = 0;
+    for (int k = 0; k < L; ++k)
+      v |= (uint32_t)ob[(size_t)(1 + i * L + k)] << k;
+    sig.z[i] = v > (uint32_t)Q / 2 ? (int32_t)v - Q : (int32_t)v; // centre
 #ifdef TEST
     emp::expecting(sig.z[i] == (int32_t)z_plain[i], "Sign test: opened z != plaintext y + c*s");
 #endif
   }
   sig.z_ok = true;
-#ifdef TEST
-  timer_lap("z reveal");
-#endif
 
   // 4.+5. All-public tail: h = MakeHint(-c t0, Az - ct + c t0, 2g2), then
   // ||c t0||_inf >= g2 or HW(h) > omega -> (c, z, bot).

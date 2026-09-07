@@ -61,6 +61,28 @@ inline void add_ripple(Ctx& ctx, Bit_T<Ctx>* out, const Bit_T<Ctx>* a, const Bit
   out[W - 1] = a[W - 1] ^ b[W - 1] ^ c;
 }
 
+// out = a + b + cin mod 2^W with a circuit-bit carry-in. out may alias a, not b.
+template <int W, class Ctx>
+inline void add_ripple_cin(Ctx&, Bit_T<Ctx>* out, const Bit_T<Ctx>* a, const Bit_T<Ctx>* b,
+                           const Bit_T<Ctx>& cin) {
+  Bit_T<Ctx> c = cin;
+  for (int i = 0; i < W - 1; ++i)
+    fa(out[i], c, a[i], b[i], c);
+  out[W - 1] = a[W - 1] ^ b[W - 1] ^ c;
+}
+
+// out = a + cin mod 2^W, cin a circuit bit (W-1 AND). out may alias a.
+template <int W, class Ctx>
+inline void add_bit_ripple(Ctx&, Bit_T<Ctx>* out, const Bit_T<Ctx>* a, const Bit_T<Ctx>& cin) {
+  Bit_T<Ctx> c = cin;
+  for (int i = 0; i < W - 1; ++i) {
+    const Bit_T<Ctx> ai = a[i]; // snapshot: out may alias a
+    out[i] = ai ^ c;
+    c = ai & c;
+  }
+  out[W - 1] = a[W - 1] ^ c;
+}
+
 // out = a + k + cin mod 2^W, k a public constant. out may alias a.
 template <int W, class Ctx>
 inline void add_const_ripple(Ctx& ctx, Bit_T<Ctx>* out, const Bit_T<Ctx>* a, uint64_t k, bool cin) {
@@ -83,6 +105,17 @@ template <int W, class Ctx> inline Bit_T<Ctx> ge_const(Ctx& ctx, const Bit_T<Ctx
     ext[i] = v[i];
   ext[W] = v[W - 1];
   add_const_ripple<W + 1>(ctx, t, ext, (uint64_t)(-C), false);
+  return !t[W];
+}
+
+// [v >= C] for UNSIGNED W-bit v (C in [0, 2^W)): sign bit of (v - C) at width W+1.
+template <int W, class Ctx>
+inline Bit_T<Ctx> ge_const_u(Ctx& ctx, const Bit_T<Ctx>* v, uint64_t C) {
+  Bit_T<Ctx> ext[W + 1], t[W + 1];
+  for (int i = 0; i < W; ++i)
+    ext[i] = v[i];
+  ext[W] = Bit_T<Ctx>::constant(ctx, false);
+  add_const_ripple<W + 1>(ctx, t, ext, (uint64_t)(-(int64_t)C), false);
   return !t[W];
 }
 
