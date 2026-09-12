@@ -31,8 +31,16 @@ template <int nP, int BitWidth, bool IsUnsigned> struct SharePair {
   static constexpr int bit_width = BitWidth;
   static constexpr bool is_unsigned = IsUnsigned;
 
-  std::vector<AuthShare> q_share;
+  std::vector<FqShare<nP>> fq_share;     // pairwise-authenticated F_q share
+  std::vector<RingShare<nP>> ring_share; // same value in Z_{2^RING_W} (two's complement if signed)
   emp::ag::AShareBundleVec<nP> two_share;
+};
+
+// Ring eDaBit (paper: eDaBit_{2^k,k}): a uniform widened R^ in Z_{2^RING_W}
+// as a ring share, and the low KB bits of R^ as Boolean shares.
+template <int nP> struct RingEdabits {
+  std::vector<RingShare<nP>> ring_share;
+  emp::ag::AShareBundleVec<nP> two_share; // KB bits per value, little-endian
 };
 
 template <int nP, int BitWidth, bool IsUnsigned>
@@ -59,18 +67,53 @@ inline SharePair<nP, BitWidth, IsUnsigned> edabits(emp::AGMPCSession<nP>& sess, 
   // DEMO CHEAT: reveal r only to manufacture a matching arithmetic share.
   // The returned object does not expose this public intermediate.
   const std::vector<uint32_t> r = open_xor(sess.io(), party, xor_r_share);
-  out.q_share.resize((size_t)count);
+  out.fq_share.resize((size_t)count);
+  out.ring_share.resize((size_t)count);
   constexpr uint64_t VALUE_RANGE = uint64_t{1} << BitWidth;
   constexpr uint32_t RANGE_MOD_Q = (uint32_t)(VALUE_RANGE % Q);
   constexpr uint32_t SIGN_BIT = uint32_t{1} << (BitWidth - 1);
   for (int i = 0; i < count; ++i) {
     uint32_t value = r[i] % Q;
+    RingVal ring_value = ring_from_u64(r[i]);
     if constexpr (!IsUnsigned)
-      if (r[i] & SIGN_BIT)
+      if (r[i] & SIGN_BIT) {
         value = fq_sub(value, RANGE_MOD_Q);
-    out.q_share[i] = dealer.deal(value);
+        ring_value = ring_sub(ring_value, ring_from_u64(VALUE_RANGE)); // sign-extend
+      }
+    out.fq_share[i] = dealer.deal_fq(value);
+    out.ring_share[i] = dealer.deal_ring(ring_value);
   }
 
+  return out;
+}
+
+// Ring eDaBits: draw RING_K Boolean bits per value, XOR-open them (same DEMO
+// cheat as above), and let the dealer split a widened R^ whose low RING_K
+// bits equal the opened R and whose high bits come from the shared stream.
+template <int nP, int KB>
+inline RingEdabits<nP> ring_edabits(emp::AGMPCSession<nP>& sess, int party,
+                                    FakeDealer<nP>& dealer, int count) {
+  static_assert(KB > 0 && KB < 32, "ring_edabits: KB must be in [1,31]");
+  emp::expecting(count >= 0, "ring_edabits: count must be non-negative");
+  RingEdabits<nP> out;
+  if (count == 0)
+    return out;
+  constexpr uint64_t KMASK = (uint64_t{1} << KB) - 1;
+  sess.protocol().fpre->abit.draw(KB * count, out.two_share);
+  std::vector<uint32_t> xor_r_share((size_t)count);
+  for (int i = 0; i < count; ++i) {
+    uint32_t v = 0;
+    for (int k = 0; k < KB; ++k)
+      v |= (uint32_t)emp::getLSB(out.two_share[(size_t)KB * i + k].mac(0)) << k;
+    xor_r_share[(size_t)i] = v;
+  }
+  const std::vector<uint32_t> r = open_xor(sess.io(), party, xor_r_share);
+  out.ring_share.resize((size_t)count);
+  for (int i = 0; i < count; ++i) {
+    RingVal v = dealer.ring_rand(); // uniform widened lift R^
+    v.w[0] = (v.w[0] & ~KMASK) | (uint64_t)r[(size_t)i]; // low KB bits are the Boolean half
+    out.ring_share[(size_t)i] = dealer.deal_ring(v);
+  }
   return out;
 }
 
@@ -100,11 +143,10 @@ inline SharePair<nP, BitWidth, false> y_edabits(emp::AGMPCSession<nP>& sess, int
   SharePair<nP, BitWidth, false> out = signed_edabits<nP, BitWidth>(sess, party, dealer, count);
   // y = s + 1: add a public constant the SPDZ way — one party adds it to the
   // value share, EVERY party adds alpha_p*1 to its MAC share (no full alpha).
-  for (AuthShare& q : out.q_share) {
-    if (party == 1)
-      q.val = fq_add(q.val, 1);
-    q.mac = fq_add(q.mac, dealer.my_alpha);
-  }
+  for (FqShare<nP>& fs : out.fq_share)
+    fs = add_public_fq(fs, 1, party, dealer.my_alpha_f);
+  for (RingShare<nP>& rs : out.ring_share)
+    rs = add_public_ring(rs, 1, party, dealer.my_alpha_r);
   return out;
 }
 
@@ -146,11 +188,11 @@ inline SharePair<nP, BitWidth, true> Fq_edabits(emp::AGMPCSession<nP>& sess, int
 
   for (int i = 0; i < count; ++i) {
     const int src = valid_index[i];
-    out.q_share[i] = out.q_share[src];
+    out.fq_share[i] = out.fq_share[src];
     for (int k = 0; k < BitWidth; ++k)
       out.two_share[BitWidth * i + k] = out.two_share[BitWidth * src + k];
   }
-  out.q_share.resize((size_t)count);
+  out.fq_share.resize((size_t)count);
   out.two_share.resize((size_t)BitWidth * count);
 
   return out;

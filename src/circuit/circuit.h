@@ -136,6 +136,21 @@ template <class Ctx> inline Bit_T<Ctx> or_tree(const Bit_T<Ctx>* v, int n) {
   return cur[0];
 }
 
+// Balanced AND reduction: n-1 AND, depth ceil(log2 n).
+template <class Ctx> inline Bit_T<Ctx> and_tree(const Bit_T<Ctx>* v, int n) {
+  std::vector<Bit_T<Ctx>> cur(v, v + n);
+  while (cur.size() > 1) {
+    std::vector<Bit_T<Ctx>> nxt;
+    size_t i = 0;
+    for (; i + 1 < cur.size(); i += 2)
+      nxt.push_back(cur[i] & cur[i + 1]);
+    if (i < cur.size())
+      nxt.push_back(cur[i]);
+    cur.swap(nxt);
+  }
+  return cur[0];
+}
+
 // [v == C] for signed W-bit v, C in two's complement.
 template <int W, class Ctx> inline Bit_T<Ctx> eq_const(Ctx& ctx, const Bit_T<Ctx>* v, int64_t C) {
   Bit_T<Ctx> diff[W];

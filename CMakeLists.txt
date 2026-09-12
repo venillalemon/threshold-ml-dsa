@@ -11,7 +11,9 @@ endif()
 # Makefile appends whatever `n=` asks for; these are just the handy defaults.
 set(MLDSA_PARTIES "2;3;5" CACHE STRING "Party counts to build main<n> for")
 set(MLDSA_PARAM   "MLDSA_65" CACHE STRING "Parameter set: MLDSA_44 | MLDSA_65 | MLDSA_87")
+set(MLDSA_SIGMA   "128" CACHE STRING "Ring authentication slack sigma (shares/MACs live in Z_2^(nu+sigma))")
 option(MLDSA_TEST "Open secret values and run PrepSign self-checks" OFF)
+option(MLDSA_SLOT "Use the slot-restricted boundary test (OFF = two-round baseline)" ON)
 option(MLDSA_TAMPER_C "Compile the adversarial c-share corruption test" OFF)
 list(REMOVE_DUPLICATES MLDSA_PARTIES)
 
@@ -27,7 +29,9 @@ foreach(_np ${MLDSA_PARTIES})
         ${CMAKE_CURRENT_SOURCE_DIR}/src/circuit
         ${CMAKE_CURRENT_SOURCE_DIR}/src/protocol)
     target_compile_definitions(main${_np}
-        PRIVATE MLDSA_NP=${_np} MLDSA_PARAM=${MLDSA_PARAM})
+        PRIVATE MLDSA_NP=${_np} MLDSA_PARAM=${MLDSA_PARAM}
+                MLDSA_SIGMA=${MLDSA_SIGMA}
+                MLDSA_SLOT=$<BOOL:${MLDSA_SLOT}>)
     if(MLDSA_TEST)
         target_compile_definitions(main${_np} PRIVATE TEST)
     endif()

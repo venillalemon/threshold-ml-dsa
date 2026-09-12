@@ -23,10 +23,10 @@ namespace mldsa {
 inline std::vector<uint32_t> test_opened_y, test_opened_w;
 #endif
 
-// PrepSign outputs: <y>_q and <w>_q (SPDZ arithmetic shares -- Sign's online
-// part only needs the linear maps z = y + c*s and w0 - c*e, which are local on
-// these), and the public w1. The Boolean <w0>_2 from Decompose is not exported:
-// w0 = w - w1*2*gamma2 mod q is recomputed linearly from <w>_q.
+// PrepSign outputs. w0_2 remains a vector of secret AG circuit values so it can
+// be consumed directly by the next circuit. y_2 is the authenticated Boolean
+// sharing returned by y_edabits (the Y_WIDTH-bit two's-complement encoding of
+// y-1). w1 is public at every party.
 template <int nP> using PrepSignCtx = typename emp::AGMPCSession<nP>::ctx_t;
 
 // A is the public matrix ExpandA(rho) from KeyGen (keygen.h), flattened
@@ -34,8 +34,9 @@ template <int nP> using PrepSignCtx = typename emp::AGMPCSession<nP>::ctx_t;
 // caller passes KeyPair::A.
 template <int nP>
 inline void prepsign(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& dealer,
-                     const std::vector<uint32_t>& A, std::vector<AuthShare>& y_q,
-                     std::vector<AuthShare>& w_q, std::vector<uint32_t>& w1) {
+                     const std::vector<uint32_t>& A,
+                     std::vector<emp::UInt_T<PrepSignCtx<nP>, OW0>>& w0_2,
+                     SharePair<nP, Y_WIDTH, false>& y_out, std::vector<uint32_t>& w1) {
   using Ctx = PrepSignCtx<nP>;
   using U23 = emp::UInt_T<Ctx, L>;
 
@@ -61,19 +62,12 @@ inline void prepsign(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& dea
 
 #ifdef TEST
   // Test-only range checks; every opened arithmetic vector is MAC-checked.
-  auto open_q_shares = [&](const std::vector<AuthShare>& shares) {
-    std::vector<uint32_t> val(shares.size()), mac(shares.size());
-    for (size_t i = 0; i < shares.size(); ++i) {
-      val[i] = shares[i].val;
-      mac[i] = shares[i].mac;
-    }
-    std::vector<uint32_t> opened = open_additive_modq(sess.io(), party, val);
-    spdz_maccheck(sess.io(), party, dealer.my_alpha, mac, opened);
-    return opened;
+  auto open_q_shares = [&](const std::vector<FqShare<nP>>& shares) {
+    return open_fq_checked(sess.io(), party, dealer.my_alpha_f, shares);
   };
   auto centered = [](uint32_t x) { return x > (uint32_t)Q / 2 ? (int32_t)x - Q : (int32_t)x; };
 
-  const std::vector<uint32_t> opened_y = open_q_shares(y.q_share);
+  const std::vector<uint32_t> opened_y = open_q_shares(y.fq_share);
   int y_min = GAMMA1 + 1, y_max = -GAMMA1 - 1, y_bad = 0;
   for (uint32_t x : opened_y) {
     const int value = centered(x);
@@ -82,7 +76,7 @@ inline void prepsign(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& dea
     y_bad += value <= -GAMMA1 || value > GAMMA1;
   }
 
-  const std::vector<uint32_t> opened_ew = open_q_shares(ew.q_share);
+  const std::vector<uint32_t> opened_ew = open_q_shares(ew.fq_share);
   int ew_min = ETA + 1, ew_max = -ETA - 1, ew_bad = 0;
   for (uint32_t x : opened_ew) {
     const int value = centered(x);
@@ -100,8 +94,8 @@ inline void prepsign(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& dea
 #endif
 
   // <w>_q=A<y>_q+<e_w>_q in F_q[x]/(x^N+1).
-  std::vector<AuthShare> w_share = ew.q_share;
-  matvec_negacyclic(A, y.q_share, w_share, K, ELL); // add A*y onto e_w
+  std::vector<FqShare<nP>> w_share = ew.fq_share;
+  matvec_negacyclic(A, y.fq_share, w_share, K, ELL); // add A*y onto e_w
 #ifdef TEST
   timer_lap("A*y + e_w (local)");
 #endif
@@ -147,18 +141,14 @@ inline void prepsign(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& dea
 
 #ifdef TEST
   // Test oracle input. This opening does not exist in the protocol build.
-  std::vector<uint32_t> w_val(COEFF_COUNT), w_mac(COEFF_COUNT);
   std::vector<int32_t> opened_w0(COEFF_COUNT);
   for (int i = 0; i < COEFF_COUNT; ++i) {
-    w_val[i] = w_share[i].val;
-    w_mac[i] = w_share[i].mac;
     const auto public_w0 = sess.reveal(w0_wires[i], emp::PUBLIC);
     emp::expecting(public_w0.has_value(), "PrepSign test: public w0 reveal failed");
     const int32_t value = (int32_t)public_w0.value();
     opened_w0[i] = value - ((value >> (OW0 - 1)) << OW0);
   }
-  const std::vector<uint32_t> opened_w = open_additive_modq(sess.io(), party, w_val);
-  spdz_maccheck(sess.io(), party, dealer.my_alpha, w_mac, opened_w);
+  const std::vector<uint32_t> opened_w = open_q_shares(w_share);
   int bad = 0;
   for (int i = 0; i < COEFF_COUNT; ++i) {
     int32_t expected_w1, expected_w0;
@@ -175,8 +165,8 @@ inline void prepsign(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& dea
   timer_lap("test w0/w1 oracle");
 #endif
 
-  y_q = std::move(y.q_share);
-  w_q = std::move(w_share);
+  w0_2 = std::move(w0_wires);
+  y_out = std::move(y);
 }
 
 } // namespace mldsa

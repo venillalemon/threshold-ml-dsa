@@ -36,8 +36,8 @@ constexpr int ETA = PARAM == MLDSA_65 ? 4 : 2;
 constexpr int TAU = PARAM == MLDSA_44 ? 39 : (PARAM == MLDSA_65 ? 49 : 60);   // +-1s in c
 constexpr int OMEGA = PARAM == MLDSA_44 ? 80 : (PARAM == MLDSA_65 ? 55 : 75); // max hint weight
 constexpr int BETA = TAU * ETA; // ||c*s||_inf, ||c*e||_inf <= BETA
-constexpr int GAMMA1 = 1 << 19;
-constexpr int Y_WIDTH = 20;      // log2(GAMMA1) + 1 for 2-complement
+constexpr int GAMMA1 = PARAM == MLDSA_44 ? 1 << 17 : 1 << 19; // FIPS 204 Table 1
+constexpr int Y_WIDTH = PARAM == MLDSA_44 ? 18 : 20; // log2(GAMMA1) + 1 for 2-complement
 constexpr int POW2ROUND_D = 13;  // Power2Round dropped bits d
 
 inline int param_k(ParamSet p) {

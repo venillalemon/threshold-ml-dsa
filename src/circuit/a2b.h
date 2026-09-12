@@ -2,7 +2,7 @@
 // Boolean circuit values <x>_2 inside the AG session, by mask-and-open:
 //
 //   1. draw edaBit masks (<r>_q, <r>_2) with r uniform in [0,Q)   (Fq_edabits)
-//   2. open c = x + r mod q publicly, gated by an SPDZ MACCheck
+//   2. open c = x + r mod q publicly, checked pairwise (BDOZ) in one flight
 //   3. inside the circuit compute x = c - r mod q                 (sub_modq)
 //
 // c = x + r is uniform in F_q independently of x (r is a one-time pad), so the
@@ -15,7 +15,7 @@
 
 #include "circuit.h" // fa, pack_bits/unpack_bits circuit primitives
 #include "edabits.h" // Fq_edabits, SharePair
-#include "spdz.h"      // AuthShare, opens, MACCheck
+#include "spdz.h"      // FqShare, checked opens
 #include <emp-ag/emp-ag.h>
 
 #include <cstdint>
@@ -57,9 +57,13 @@ inline UInt_T<Ctx, L> sub_modq(Ctx& ctx, const UInt_T<Ctx, L>& c, // public
   const Bit_T<Ctx> need = !cout;
   Bit_T<Ctx> w[L], carry = Bit_T<Ctx>::constant(ctx, false); // carry-in = 0
   for (int i = 0; i < L; ++i) {
-    const Bit_T<Ctx> q_i = Bit_T<Ctx>::constant(ctx, ((Q >> i) & 1) != 0); // public Q bit
-    const Bit_T<Ctx> add_i = need & q_i;                                   // Q[i] iff borrowed
-    fa(w[i], carry, d[i], add_i, carry);
+    // Q's bits are compile-time constants: where Q[i]=1 the addend is `need`
+    // itself, where Q[i]=0 the full adder degenerates to a half adder. Folding
+    // this saves one AND per bit over materialising need & Q[i].
+    if (((Q >> i) & 1) != 0)
+      fa(w[i], carry, d[i], need, carry);
+    else
+      ha(w[i], carry, d[i], carry);
   }
   // final carry dropped => w = (c - r) mod Q, in [0, Q).
   return pack_bits<L>(ctx, w);
@@ -68,7 +72,7 @@ inline UInt_T<Ctx, L> sub_modq(Ctx& ctx, const UInt_T<Ctx, L>& c, // public
 template <int nP>
 inline std::vector<emp::UInt_T<typename emp::AGMPCSession<nP>::ctx_t, L>>
 a2b(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& dealer,
-    const std::vector<AuthShare>& x_share) {
+    const std::vector<FqShare<nP>>& x_share) {
   using Ctx = typename emp::AGMPCSession<nP>::ctx_t;
   using U23 = emp::UInt_T<Ctx, L>;
   const int count = (int)x_share.size();
@@ -77,18 +81,14 @@ a2b(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& dealer,
   SharePair<nP, L, true> r = Fq_edabits<nP, L>(sess, party, dealer, count);
 
   // 2. open c = x + r with an SPDZ MACCheck.
-  std::vector<uint32_t> c_val(count), c_mac(count);
-  for (int i = 0; i < count; ++i) {
-    const AuthShare c_share = x_share[i] + r.q_share[i];
-    c_val[i] = c_share.val;
-    c_mac[i] = c_share.mac;
-  }
+  std::vector<FqShare<nP>> c_share((size_t)count);
+  for (int i = 0; i < count; ++i)
+    c_share[(size_t)i] = x_share[(size_t)i] + r.fq_share[(size_t)i];
 #ifdef TAMPER_C
   if (party == 1 && count > 0)
-    c_val[0] ^= 1;
+    c_share[0].val ^= 1;
 #endif
-  const std::vector<uint32_t> c = open_additive_modq(sess.io(), party, c_val);
-  spdz_maccheck(sess.io(), party, dealer.my_alpha, c_mac, c);
+  const std::vector<uint32_t> c = open_fq_checked(sess.io(), party, dealer.my_alpha_f, c_share);
 
   // 3. x = c - r mod q inside the circuit.
   std::vector<U23> out;

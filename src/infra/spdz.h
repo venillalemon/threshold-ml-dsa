@@ -1,14 +1,14 @@
 // src/infra/spdz.h — the arithmetic "front" of Pi_PrepSign (demo SPDZ / edaBit layer).
 //
-// The world in FRONT of the GC: authenticated additive shares over F_Q
-// (AuthShare = a value share of x plus a MAC share of α·x under a global key α),
-// the transport opens that reconstruct them, and the SPDZ MACCheck that gates a
-// public c.  FakeDealer (bottom of this file) FAKES the SPDZ offline from a
-// shared seed — replace it (and the r-open cheat in edabits.h) with a real
-// SPDZ engine; keep the opens and the MACCheck.
-//
-// Templated on party count nP: deduced from NetIOMP<nP> for the opens /
-// MACCheck; FakeDealer<nP> carries it as a class template parameter.
+// The world in FRONT of the GC. Every authenticated value -- over F_q and over
+// the widened power-of-two ring -- carries PAIRWISE (BDOZ) MACs: for each
+// ordered pair (j, i) party P_j holds a one-time key on P_i's share and P_i
+// holds M = K + alpha_j * share. An opening is therefore verified locally by
+// the receiver and costs a single flight, in both domains. F_q MACs are
+// repeated FQ_MAC_REP times because one 23-bit MAC only gives 2^-23.
+// FakeDealer (bottom of this file) FAKES the offline from a shared seed --
+// replace it (and the r-open cheat in edabits.h) with a real offline; keep the
+// share layout and the checked opens.
 #ifndef MLDSA_SPDZ_H
 #define MLDSA_SPDZ_H
 
@@ -17,6 +17,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -25,31 +26,266 @@ namespace mldsa {
 using emp::expecting;
 using emp::NetIOMP;
 
-// SPDZ authenticated additive share of x over F_Q: value share of x + MAC share
-// of α·x.  Linear ops (add, add-public) are local on both fields.
-struct AuthShare {
-  uint32_t val = 0; // additive part of x
-  uint32_t mac = 0; // additive part of α·x
+// ---- authenticated shares over the ring Z_{2^(nu+sigma)} ---------------------
+// Widened power-of-two ring for the post-challenge window (paper Sec. 3.1:
+// BDOZ-style pairwise authentication with the SPDZ2k widened representation).
+// The semantic value lives in Z_{2^RING_K} (nu = b+1 bits); the extra
+// RING_SIGMA bits carry the authentication slack: an alteration of a low-nu
+// residue has 2-adic valuation at most nu-1, so a forgery succeeds with
+// probability about 2^-RING_SIGMA. MLDSA_SIGMA is a build parameter
+// (make SIGMA=...); the papers instantiate sigma = 128.
+constexpr int RING_K = 2 * BETA < 256 ? 9 : 10; // nu = b + 1, with L = 2^b > 2*BETA
+static_assert(2 * BETA < (1 << (RING_K - 1)), "RING_K window too narrow for 2*beta");
+#ifndef MLDSA_SIGMA
+#define MLDSA_SIGMA 128
+#endif
+constexpr int RING_SIGMA = MLDSA_SIGMA;
+constexpr int RING_W = RING_K + RING_SIGMA; // nu + sigma
+constexpr uint64_t RING_KMASK = (uint64_t{1} << RING_K) - 1;
+constexpr int RING_WORDS = (RING_W + 63) / 64;
+static_assert(RING_SIGMA >= 8 && RING_WORDS <= 3, "sigma must keep nu+sigma within 192 bits");
+
+// Fixed-width unsigned integer mod 2^RING_W, little-endian 64-bit words.
+struct RingVal {
+  uint64_t w[RING_WORDS] = {};
 };
-inline AuthShare operator+(const AuthShare& a, const AuthShare& b) {
-  return {fq_add(a.val, b.val), fq_add(a.mac, b.mac)}; // linear: both fields add locally
+inline void ring_reduce(RingVal& a) {
+  constexpr int top = RING_W - 64 * (RING_WORDS - 1);
+  if constexpr (top < 64)
+    a.w[RING_WORDS - 1] &= (uint64_t{1} << top) - 1;
 }
-inline AuthShare operator*(const AuthShare& x, uint32_t c) {
-  return {fq_mul(x.val, c), fq_mul(x.mac, c)};
+inline RingVal ring_add(const RingVal& a, const RingVal& b) {
+  RingVal r;
+  unsigned __int128 c = 0;
+  for (int i = 0; i < RING_WORDS; ++i) {
+    c += (unsigned __int128)a.w[i] + b.w[i];
+    r.w[i] = (uint64_t)c;
+    c >>= 64;
+  }
+  ring_reduce(r);
+  return r;
 }
-// x + k for public k: party 1 carries k in the value share; every party adds
-// its alpha-share times k to the MAC share (sum over parties = alpha*k).
-inline AuthShare add_public(const AuthShare& x, uint32_t k, int party, uint32_t my_alpha) {
-  return {party == 1 ? fq_add(x.val, k) : x.val, fq_add(x.mac, fq_mul(my_alpha, k))};
+inline RingVal ring_sub(const RingVal& a, const RingVal& b) {
+  RingVal r;
+  unsigned __int128 borrow = 0;
+  for (int i = 0; i < RING_WORDS; ++i) {
+    const unsigned __int128 d = (unsigned __int128)a.w[i] - b.w[i] - borrow;
+    r.w[i] = (uint64_t)d;
+    borrow = (d >> 64) ? 1 : 0;
+  }
+  ring_reduce(r);
+  return r;
+}
+// Schoolbook low-half product: only the low RING_W bits are defined.
+inline RingVal ring_mul(const RingVal& a, const RingVal& b) {
+  uint64_t acc[RING_WORDS + 1] = {};
+  for (int i = 0; i < RING_WORDS; ++i) {
+    uint64_t carry = 0;
+    for (int j = 0; i + j < RING_WORDS; ++j) {
+      const unsigned __int128 t =
+          (unsigned __int128)a.w[i] * b.w[j] + acc[i + j] + carry;
+      acc[i + j] = (uint64_t)t;
+      carry = (uint64_t)(t >> 64);
+    }
+    if (i + RING_WORDS <= RING_WORDS)
+      acc[RING_WORDS] += carry;
+  }
+  RingVal r;
+  for (int i = 0; i < RING_WORDS; ++i)
+    r.w[i] = acc[i];
+  ring_reduce(r);
+  return r;
+}
+inline RingVal ring_from_u64(uint64_t v) {
+  RingVal r;
+  r.w[0] = v;
+  ring_reduce(r);
+  return r;
+}
+inline RingVal ring_from_i64(int64_t v) { // two's complement lift
+  RingVal r = ring_from_u64((uint64_t)(v < 0 ? -v : v));
+  return v < 0 ? ring_sub(RingVal{}, r) : r;
+}
+inline uint64_t ring_low(const RingVal& a) { return a.w[0]; } // low 64 bits
+
+// ---- wire format: RING_W bits per value, bit-packed (paper: m(nu+sigma) bits)
+inline size_t ring_packed_bytes(size_t count) { return (count * (size_t)RING_W + 7) / 8; }
+inline std::vector<uint8_t> ring_pack(const std::vector<RingVal>& v) {
+  std::vector<uint8_t> out(ring_packed_bytes(v.size()), 0);
+  size_t bit = 0;
+  for (const RingVal& x : v)
+    for (int k = 0; k < RING_W; ++k, ++bit)
+      if ((x.w[k >> 6] >> (k & 63)) & 1)
+        out[bit >> 3] |= (uint8_t)(1u << (bit & 7));
+  return out;
+}
+inline std::vector<RingVal> ring_unpack(const std::vector<uint8_t>& in, size_t count) {
+  std::vector<RingVal> out(count);
+  size_t bit = 0;
+  for (size_t i = 0; i < count; ++i)
+    for (int k = 0; k < RING_W; ++k, ++bit)
+      if ((in[bit >> 3] >> (bit & 7)) & 1)
+        out[i].w[k >> 6] |= uint64_t{1} << (k & 63);
+  return out;
+}
+
+// Pairwise (BDOZ) authentication: for every ordered pair (j, i), P_j holds a
+// one-time key K_{j,i} on P_i's share and P_i holds M_{j,i} = K_{j,i} + alpha_j * x_i,
+// with alpha_j P_j's private slope reused across values. Everything is linear,
+// and an opening is verified by the RECEIVER alone -- one flight, no second open.
+template <int nP> struct RingShare {
+  RingVal val;                       // my additive share of x mod 2^RING_W
+  std::array<RingVal, nP + 1> mac{}; // mac[j]: MAC on my share under P_j's key
+  std::array<RingVal, nP + 1> key{}; // key[i]: my key on P_i's share
+};
+template <int nP> inline RingShare<nP> operator+(const RingShare<nP>& a, const RingShare<nP>& b) {
+  RingShare<nP> r;
+  r.val = ring_add(a.val, b.val);
+  for (int p = 1; p <= nP; ++p) {
+    r.mac[p] = ring_add(a.mac[p], b.mac[p]);
+    r.key[p] = ring_add(a.key[p], b.key[p]);
+  }
+  return r;
+}
+template <int nP> inline RingShare<nP> operator-(const RingShare<nP>& a, const RingShare<nP>& b) {
+  RingShare<nP> r;
+  r.val = ring_sub(a.val, b.val);
+  for (int p = 1; p <= nP; ++p) {
+    r.mac[p] = ring_sub(a.mac[p], b.mac[p]);
+    r.key[p] = ring_sub(a.key[p], b.key[p]);
+  }
+  return r;
+}
+template <int nP> inline RingShare<nP> operator*(const RingShare<nP>& x, uint64_t c) {
+  const RingVal cv = ring_from_u64(c);
+  RingShare<nP> r;
+  r.val = ring_mul(x.val, cv);
+  for (int p = 1; p <= nP; ++p) {
+    r.mac[p] = ring_mul(x.mac[p], cv);
+    r.key[p] = ring_mul(x.key[p], cv);
+  }
+  return r;
+}
+// x + k for public k: party 1 adds k to its share; every other party lowers its
+// key on party 1's share by alpha_me * k so M = K + alpha * x_1 still holds.
+template <int nP>
+inline RingShare<nP> add_public_ring(RingShare<nP> x, uint64_t k, int party,
+                                     const RingVal& alpha_me) {
+  if (party == 1)
+    x.val = ring_add(x.val, ring_from_u64(k));
+  else
+    x.key[1] = ring_sub(x.key[1], ring_mul(alpha_me, ring_from_u64(k)));
+  return x;
+}
+
+// ---- pairwise (BDOZ) authentication over F_q --------------------------------
+// A single 23-bit MAC gives only 2^-23 soundness, so the slopes are repeated
+// FQ_MAC_REP times with independent keys (paper Sec. 3.1: "the realization must
+// amplify authentication ... through suitable extension-field or repeated
+// authentication"). Verification is local at the receiver, so an opening needs
+// no second flight -- that is what lets V ride in flight 1.
+constexpr int FQ_MAC_REP = (MLDSA_SIGMA + L - 1) / L; // R with 2^-(23R) soundness
+using FqMac = std::array<uint32_t, FQ_MAC_REP>;
+inline FqMac fq_mac_add(const FqMac& a, const FqMac& b) {
+  FqMac r{};
+  for (int i = 0; i < FQ_MAC_REP; ++i)
+    r[i] = fq_add(a[i], b[i]);
+  return r;
+}
+inline FqMac fq_mac_mul(const FqMac& a, uint32_t c) {
+  FqMac r{};
+  for (int i = 0; i < FQ_MAC_REP; ++i)
+    r[i] = fq_mul(a[i], c);
+  return r;
+}
+
+template <int nP> struct FqShare {
+  uint32_t val = 0;                  // my additive share of x mod q
+  std::array<FqMac, nP + 1> mac{};   // mac[j] = key_{j,me} + alpha_j * val_me
+  std::array<FqMac, nP + 1> key{};   // key[i]: my keys on P_i's share
+};
+template <int nP> inline FqShare<nP> operator+(const FqShare<nP>& a, const FqShare<nP>& b) {
+  FqShare<nP> r;
+  r.val = fq_add(a.val, b.val);
+  for (int p = 1; p <= nP; ++p) {
+    r.mac[p] = fq_mac_add(a.mac[p], b.mac[p]);
+    r.key[p] = fq_mac_add(a.key[p], b.key[p]);
+  }
+  return r;
+}
+template <int nP> inline FqShare<nP> operator*(const FqShare<nP>& x, uint32_t c) {
+  FqShare<nP> r;
+  r.val = fq_mul(x.val, c);
+  for (int p = 1; p <= nP; ++p) {
+    r.mac[p] = fq_mac_mul(x.mac[p], c);
+    r.key[p] = fq_mac_mul(x.key[p], c);
+  }
+  return r;
+}
+template <int nP>
+inline FqShare<nP> add_public_fq(FqShare<nP> x, uint32_t k, int party, const FqMac& alpha_me) {
+  if (party == 1)
+    x.val = fq_add(x.val, k);
+  else
+    for (int i = 0; i < FQ_MAC_REP; ++i)
+      x.key[1][i] = fq_sub(x.key[1][i], fq_mul(alpha_me[i], k));
+  return x;
+}
+
+// Checked pairwise opening over F_q, one flight: shares plus one digest of the
+// MAC vector per ordered pair, verified locally by the receiver.
+template <int nP>
+inline std::vector<uint32_t> open_fq_checked(NetIOMP<nP>& io, int party, const FqMac& alpha_me,
+                                             const std::vector<FqShare<nP>>& x) {
+  const size_t len = x.size();
+  std::vector<uint32_t> mine(len);
+  for (size_t t = 0; t < len; ++t)
+    mine[t] = x[t].val;
+  std::vector<uint32_t> macs(len * FQ_MAC_REP);
+  auto digest_of = [&](int from, int to, char* out) {
+    emp::Hash h;
+    const uint32_t ids[2] = {(uint32_t)from, (uint32_t)to};
+    h.put(ids, sizeof(ids));
+    h.put(macs.data(), (int64_t)macs.size() * sizeof(uint32_t));
+    h.digest(out);
+  };
+  char dg[emp::Hash::DIGEST_SIZE];
+  for (int j = 1; j <= nP; ++j)
+    if (j != party) {
+      for (size_t t = 0; t < len; ++t)
+        for (int r = 0; r < FQ_MAC_REP; ++r)
+          macs[t * FQ_MAC_REP + r] = x[t].mac[j][r];
+      digest_of(party, j, dg);
+      io.send_data(j, mine.data(), len * sizeof(uint32_t));
+      io.send_data(j, dg, sizeof(dg));
+    }
+  io.flush();
+  std::vector<uint32_t> acc = mine, buf(len);
+  char peer_dg[emp::Hash::DIGEST_SIZE];
+  for (int i = 1; i <= nP; ++i)
+    if (i != party) {
+      io.recv_data(i, buf.data(), len * sizeof(uint32_t));
+      io.recv_data(i, peer_dg, sizeof(peer_dg));
+      for (size_t t = 0; t < len; ++t)
+        for (int r = 0; r < FQ_MAC_REP; ++r)
+          macs[t * FQ_MAC_REP + r] = fq_add(x[t].key[i][r], fq_mul(alpha_me[r], buf[t]));
+      digest_of(i, party, dg);
+      expecting(std::memcmp(dg, peer_dg, sizeof(dg)) == 0,
+                "BDOZ F_q opening failed: peer share does not match its MAC");
+      for (size_t t = 0; t < len; ++t)
+        acc[t] = fq_add(acc[t], buf[t]);
+    }
+  return acc;
 }
 
 // ---- public matrix x shared vector over R_q --------------------------------
 // acc += A * x in R_q^rows with R_q = F_Q[X]/(X^N+1); A is a public rows x cols
 // matrix of polynomials (flattened, N coefficients each), x a shared cols-vector.
 // Call with acc preloaded with the additive term (e.g. <e>_q), length rows*N.
-// Purely local: AuthShare is linear under public-constant multiplication.
-inline void matvec_negacyclic(const std::vector<uint32_t>& A, const std::vector<AuthShare>& x,
-                              std::vector<AuthShare>& acc, int rows, int cols) {
+// Purely local: FqShare is linear under public-constant multiplication.
+template <int nP>
+inline void matvec_negacyclic(const std::vector<uint32_t>& A, const std::vector<FqShare<nP>>& x,
+                              std::vector<FqShare<nP>>& acc, int rows, int cols) {
   expecting((int)A.size() == rows * cols * N, "matvec_negacyclic: A size");
   expecting((int)x.size() == cols * N, "matvec_negacyclic: x size");
   expecting((int)acc.size() == rows * N, "matvec_negacyclic: acc size");
@@ -74,24 +310,117 @@ inline void matvec_negacyclic(const std::vector<uint32_t>& A, const std::vector<
 // each peer's. Runs BEFORE any GC op and is symmetric + fully drained, so it is
 // safe on the session's GC mesh.
 
-// Reconstruct  Σ_p share_p  (mod Q).
+// Checked BDOZ ring opening in ONE flight: bit-packed widened shares plus one
+// digest of the MAC vector per ordered pair, verified locally by the receiver.
 template <int nP>
-inline std::vector<uint32_t> open_additive_modq(NetIOMP<nP>& io, int party,
-                                                const std::vector<uint32_t>& mine) {
-  int len = mine.size();
-  std::vector<uint32_t> acc = mine;
-  for (int p = 1; p <= nP; ++p)
-    if (p != party)
-      io.send_data(p, mine.data(), (size_t)len * sizeof(uint32_t));
+inline std::vector<RingVal> open_ring_checked(NetIOMP<nP>& io, int party, const RingVal& alpha_me,
+                                              const std::vector<RingShare<nP>>& x) {
+  const size_t len = x.size();
+  std::vector<RingVal> mine(len), tmp(len);
+  for (size_t t = 0; t < len; ++t)
+    mine[t] = x[t].val;
+  const std::vector<uint8_t> mine_packed = ring_pack(mine);
+  auto digest_of = [&](int from, int to, const std::vector<RingVal>& macs, char* out) {
+    const std::vector<uint8_t> packed = ring_pack(macs);
+    emp::Hash h;
+    const uint32_t ids[2] = {(uint32_t)from, (uint32_t)to};
+    h.put(ids, sizeof(ids));
+    h.put(packed.data(), (int64_t)packed.size());
+    h.digest(out);
+  };
+  char dg[emp::Hash::DIGEST_SIZE];
+  for (int j = 1; j <= nP; ++j)
+    if (j != party) {
+      for (size_t t = 0; t < len; ++t)
+        tmp[t] = x[t].mac[j];
+      digest_of(party, j, tmp, dg);
+      io.send_data(j, mine_packed.data(), mine_packed.size());
+      io.send_data(j, dg, sizeof(dg));
+    }
   io.flush();
-  std::vector<uint32_t> buf(len);
-  for (int p = 1; p <= nP; ++p)
-    if (p != party) {
-      io.recv_data(p, buf.data(), (size_t)len * sizeof(uint32_t));
-      for (int i = 0; i < len; ++i)
-        acc[i] = fq_add(acc[i], buf[i]);
+  std::vector<RingVal> acc = mine;
+  std::vector<uint8_t> buf(mine_packed.size());
+  char peer_dg[emp::Hash::DIGEST_SIZE];
+  for (int i = 1; i <= nP; ++i)
+    if (i != party) {
+      io.recv_data(i, buf.data(), buf.size());
+      io.recv_data(i, peer_dg, sizeof(peer_dg));
+      const std::vector<RingVal> peer = ring_unpack(buf, len);
+      for (size_t t = 0; t < len; ++t)
+        tmp[t] = ring_add(x[t].key[i], ring_mul(alpha_me, peer[t]));
+      digest_of(i, party, tmp, dg);
+      expecting(std::memcmp(dg, peer_dg, sizeof(dg)) == 0,
+                "BDOZ ring opening failed: peer share does not match its MAC");
+      for (size_t t = 0; t < len; ++t)
+        acc[t] = ring_add(acc[t], peer[t]);
     }
   return acc;
+}
+
+// One-flight opening carrying BOTH domains, as the slot protocol's flight 1
+// does. Each half is authenticated pairwise (BDOZ) and verified locally by the
+// receiver from its own keys, so the whole thing is a single exchange.
+template <int nP>
+inline void open_ring_and_fq(NetIOMP<nP>& io, int party, const RingVal& alpha_me,
+                             const FqMac& fq_alpha_me, const std::vector<RingShare<nP>>& rx,
+                             const std::vector<FqShare<nP>>& fx, std::vector<RingVal>& ring_out,
+                             std::vector<uint32_t>& fq_out) {
+  const size_t len = rx.size(), flen = fx.size();
+  std::vector<uint32_t> fq(flen);
+  for (size_t t = 0; t < flen; ++t)
+    fq[t] = fx[t].val;
+  std::vector<RingVal> mine(len), tmp(len);
+  for (size_t t = 0; t < len; ++t)
+    mine[t] = rx[t].val;
+  const std::vector<uint8_t> mine_packed = ring_pack(mine);
+  std::vector<uint32_t> fmac(flen * FQ_MAC_REP);
+  auto digest_of = [&](int from, int to, const std::vector<RingVal>& macs, char* out) {
+    const std::vector<uint8_t> packed = ring_pack(macs);
+    emp::Hash h;
+    const uint32_t ids[2] = {(uint32_t)from, (uint32_t)to};
+    h.put(ids, sizeof(ids));
+    h.put(packed.data(), (int64_t)packed.size());
+    h.put(fmac.data(), (int64_t)fmac.size() * sizeof(uint32_t));
+    h.digest(out);
+  };
+  char dg[emp::Hash::DIGEST_SIZE];
+  for (int j = 1; j <= nP; ++j)
+    if (j != party) {
+      for (size_t t = 0; t < len; ++t)
+        tmp[t] = rx[t].mac[j];
+      for (size_t t = 0; t < flen; ++t)
+        for (int i = 0; i < FQ_MAC_REP; ++i)
+          fmac[t * FQ_MAC_REP + i] = fx[t].mac[j][i];
+      digest_of(party, j, tmp, dg);
+      io.send_data(j, mine_packed.data(), mine_packed.size());
+      io.send_data(j, fq.data(), flen * sizeof(uint32_t));
+      io.send_data(j, dg, sizeof(dg));
+    }
+  io.flush();
+  ring_out = mine;
+  fq_out = fq;
+  std::vector<uint8_t> buf(mine_packed.size());
+  std::vector<uint32_t> fbuf(flen);
+  char peer_dg[emp::Hash::DIGEST_SIZE];
+  for (int i = 1; i <= nP; ++i)
+    if (i != party) {
+      io.recv_data(i, buf.data(), buf.size());
+      io.recv_data(i, fbuf.data(), flen * sizeof(uint32_t));
+      io.recv_data(i, peer_dg, sizeof(peer_dg));
+      const std::vector<RingVal> peer = ring_unpack(buf, len);
+      for (size_t t = 0; t < len; ++t)
+        tmp[t] = ring_add(rx[t].key[i], ring_mul(alpha_me, peer[t]));
+      for (size_t t = 0; t < flen; ++t)
+        for (int r = 0; r < FQ_MAC_REP; ++r)
+          fmac[t * FQ_MAC_REP + r] = fq_add(fx[t].key[i][r], fq_mul(fq_alpha_me[r], fbuf[t]));
+      digest_of(i, party, tmp, dg);
+      expecting(std::memcmp(dg, peer_dg, sizeof(dg)) == 0,
+                "BDOZ opening failed: peer share does not match its MAC");
+      for (size_t t = 0; t < len; ++t)
+        ring_out[t] = ring_add(ring_out[t], peer[t]);
+      for (size_t t = 0; t < flen; ++t)
+        fq_out[t] = fq_add(fq_out[t], fbuf[t]);
+    }
 }
 
 // XOR-open a GF(2) sharing: reconstruct  ⊕_p share_p.  Used to open the drawn r
@@ -115,39 +444,13 @@ inline std::vector<uint32_t> open_xor(NetIOMP<nP>& io, int party,
   return acc;
 }
 
-// SPDZ batched MACCheck. After opening public c[i], verify  Σ_p mac_i^p == α·c_i
-// for all i. Per party: σ_i = mac_i − α^me·c_i; a public random combination
-// s = Σ_i χ_i·σ_i is opened across parties and must be 0, because
-//   Σ_p s^p = Σ_i χ_i ( Σ_p mac_i^p − (Σ_p α^p)·c_i ) = Σ_i χ_i(α·c_i − α·c_i) = 0.
-// A wrong opened c (or tampered mac) makes it nonzero -> abort. THIS is where the
-// authenticated shares of w/r "do their work". (DEMO: χ from a fixed public coin
-// and σ opened directly; real SPDZ draws χ AFTER commitments and commit-opens σ —
-// rush-secure. Same mechanism.)
-template <int nP>
-inline void spdz_maccheck(NetIOMP<nP>& io, int party, uint32_t my_alpha,
-                          const std::vector<uint32_t>& my_mac, const std::vector<uint32_t>& c) {
-  expecting(my_mac.size() == c.size(), "spdz_maccheck: my_mac and c same length");
-  int len = my_mac.size();
-  std::mt19937 coin(0xC0FFEEu); // public coin, same at every party (DEMO)
-  uint32_t s = 0;
-  for (int i = 0; i < len; ++i) {
-    const uint32_t chi = coin() % Q;
-    const uint32_t sigma = fq_sub(my_mac[i], fq_mul(my_alpha, c[i])); // mac_i − α·c_i
-    s = fq_add(s, fq_mul(chi, sigma));
-  }
-  const uint32_t sum = open_additive_modq(io, party, std::vector<uint32_t>{s})[0];
-  expecting(sum == 0, "SPDZ MACCheck failed: opened c is not authenticated (alpha*c != sum mac)");
-}
-
-// ==== DEMO SPDZ dealer (replace with a real offline: MASCOT / Overdrive) ====
-// The ONLY holder of the full MAC key. In real SPDZ the full alpha never
-// exists: each party samples its own alpha_p locally (alpha = Σ alpha_p is
-// never reconstructed), and a MAC share of alpha*x is assembled from the
-// pairwise cross products x_i*alpha_j, obtained via correlated OT (MASCOT) or
-// homomorphic encryption (Overdrive), plus the local alpha_p*x_p term.
-// Replacing this struct with such an offline is the SPDZ de-cheat: protocol
-// code only ever touches dealer.my_alpha and dealer.deal(v), both of which a
-// real offline can serve without the `alpha` field existing.
+// ==== DEMO offline dealer (replace with a real one: MASCOT / Overdrive) ====
+// The ONLY holder of every party's slopes. In a real BDOZ offline each party
+// samples its own alpha_j and never reveals it; the pairwise (key, MAC) pairs
+// on a peer's share are produced by correlated OT or homomorphic encryption.
+// Replacing this struct is the de-cheat: protocol code only ever touches
+// dealer.my_alpha_f / my_alpha_r and the deal_* entry points, all of which a
+// real offline can serve without any party holding another's slope.
 //
 // The fake works by determinism, not secrecy: every party runs the IDENTICAL
 // seeded rng, COMPUTES the whole split, and only ever USES its own slot
@@ -156,23 +459,78 @@ inline void spdz_maccheck(NetIOMP<nP>& io, int party, uint32_t my_alpha,
 template <int nP> struct FakeDealer {
   int party;
   std::mt19937 rng;  // shared seed: every party runs the identical stream
-  uint32_t alpha;    // CHEAT: full key, derived from the shared seed
-  uint32_t my_alpha; // this party's key share — all that protocols may see
+  std::array<RingVal, nP + 1> alpha_r{};  // CHEAT: every party's ring BDOZ slope
+  RingVal my_alpha_r;                     // this party's own ring slope
+  std::array<FqMac, nP + 1> alpha_f{};    // CHEAT: every party's R F_q slopes
+  FqMac my_alpha_f{};                     // this party's own F_q slopes
 
   FakeDealer(int party, uint32_t seed) : party(party), rng(seed) {
-    alpha = rng() % Q;
-    my_alpha = arith_split(alpha)[party];
+    for (int p = 1; p <= nP; ++p)
+      alpha_r[p] = ring_rand();
+    my_alpha_r = alpha_r[party];
+    for (int p = 1; p <= nP; ++p)
+      for (int i = 0; i < FQ_MAC_REP; ++i)
+        alpha_f[p][i] = rng() % Q;
+    my_alpha_f = alpha_f[party];
   }
 
-  // This party's authenticated share of a dealer-chosen value v:
-  // value shares sum to v, MAC shares sum to alpha*v.
-  AuthShare deal(uint32_t v) {
-    const auto vs = arith_split(v);              // Σ = v
-    const auto ms = arith_split(fq_mul(alpha, v)); // Σ = α·v
-    return {vs[party], ms[party]};
+  // BDOZ over the widened ring: additive shares of v, and for every ordered
+  // pair (j, i) a key K_{j,i} at P_j and MAC K_{j,i} + alpha_j * v_i at P_i.
+  // Every party walks the identical stream and keeps only its own slots.
+  RingShare<nP> deal_ring(const RingVal& v) {
+    const auto vs = ring_split(v);
+    RingShare<nP> out;
+    out.val = vs[party];
+    for (int j = 1; j <= nP; ++j)
+      for (int i = 1; i <= nP; ++i) {
+        if (i == j) continue;
+        const RingVal k = ring_rand();
+        if (party == j) out.key[i] = k;
+        if (party == i) out.mac[j] = ring_add(k, ring_mul(alpha_r[j], vs[i]));
+      }
+    return out;
+  }
+
+  // Pairwise-authenticated F_q share of v (same structure as deal_ring).
+  FqShare<nP> deal_fq(uint32_t v) {
+    const auto vs = arith_split(v);
+    FqShare<nP> out;
+    out.val = vs[party];
+    for (int j = 1; j <= nP; ++j)
+      for (int i = 1; i <= nP; ++i) {
+        if (i == j) continue;
+        FqMac k{};
+        for (int r = 0; r < FQ_MAC_REP; ++r)
+          k[r] = rng() % Q;
+        if (party == j) out.key[i] = k;
+        if (party == i)
+          for (int r = 0; r < FQ_MAC_REP; ++r)
+            out.mac[j][r] = fq_add(k[r], fq_mul(alpha_f[j][r], vs[i]));
+      }
+    return out;
+  }
+
+  // Uniform element of Z_{2^RING_W} from the shared stream (same at every party).
+  RingVal ring_rand() {
+    RingVal r;
+    for (int i = 0; i < RING_WORDS; ++i)
+      r.w[i] = ((uint64_t)rng() << 32) | rng();
+    ring_reduce(r);
+    return r;
   }
 
 private:
+  std::array<RingVal, nP + 1> ring_split(const RingVal& v) {
+    std::array<RingVal, nP + 1> s{};
+    RingVal acc;
+    for (int p = 1; p < nP; ++p) {
+      s[p] = ring_rand();
+      acc = ring_add(acc, s[p]);
+    }
+    s[nP] = ring_sub(v, acc);
+    return s;
+  }
+
   // Additive split of v over F_Q; slot p is party p's share.
   std::array<uint32_t, nP + 1> arith_split(uint32_t v) {
     std::array<uint32_t, nP + 1> s{};

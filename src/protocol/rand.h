@@ -22,9 +22,9 @@
 
 namespace mldsa {
 
-inline AuthShare rand_scale(const AuthShare& x, uint32_t c) {
-  return {fq_mul(x.val, c), fq_mul(x.mac, c)};
-}
+// AND gates spent inside eDaBit/daBit rejection sampling. These are correlation
+// generation, not protocol circuit work, so cost tables report them separately.
+inline uint64_t g_edabit_ands = 0;
 
 constexpr int64_t isqrt_floor(int64_t v) { // floor(sqrt(v)), constexpr-safe
   int64_t r = 0;
@@ -54,6 +54,7 @@ inline SharePair<nP, (ETA == 2 ? 3 : 4), false> rand_edabits(emp::AGMPCSession<n
   if constexpr (COUNT == 0)
     return out;
 
+  const uint64_t edabit_and0 = sess.num_and();
   SharePair<nP, 1, true> dabits = unsigned_edabits<nP, 1>(sess, party, dealer, BIT_COUNT);
 
   // Adopt every candidate bit in one AG input-label exchange, then evaluate
@@ -91,22 +92,27 @@ inline SharePair<nP, (ETA == 2 ? 3 : 4), false> rand_edabits(emp::AGMPCSession<n
   emp::expecting((int)valid_index.size() >= COUNT,
                  "rand: oversampled batch contained too few small-norm values");
 
+  g_edabit_ands += sess.num_and() - edabit_and0;
+
   // Keep the first COUNT accepted candidates. Boolean and arithmetic shares
   // are copied using the same source index, preserving each daBit-derived pair.
-  out.q_share.resize((size_t)COUNT);
+  out.fq_share.resize((size_t)COUNT);
+  out.ring_share.resize((size_t)COUNT);
   out.two_share.resize((size_t)WIDTH * COUNT);
   for (int i = 0; i < COUNT; ++i) {
     const int src = valid_index[i];
     const int base = WIDTH * src;
-    AuthShare q = dabits.q_share[base];
-    q = q + rand_scale(dabits.q_share[base + 1], 2);
+    FqShare<nP> f = dabits.fq_share[base] + dabits.fq_share[base + 1] * 2;
+    RingShare<nP> rs = dabits.ring_share[base] + dabits.ring_share[base + 1] * 2;
     if constexpr (ETA == 2) {
-      q = q + rand_scale(dabits.q_share[base + 2], Q - 4);
+      f = f + dabits.fq_share[base + 2] * (uint32_t)(Q - 4);
+      rs = rs - dabits.ring_share[base + 2] * 4;
     } else {
-      q = q + rand_scale(dabits.q_share[base + 2], 4);
-      q = q + rand_scale(dabits.q_share[base + 3], Q - 8);
+      f = f + dabits.fq_share[base + 2] * 4 + dabits.fq_share[base + 3] * (uint32_t)(Q - 8);
+      rs = rs + dabits.ring_share[base + 2] * 4 - dabits.ring_share[base + 3] * 8;
     }
-    out.q_share[i] = q;
+    out.fq_share[i] = f;
+    out.ring_share[i] = rs;
     for (int k = 0; k < WIDTH; ++k)
       out.two_share[WIDTH * i + k] = dabits.two_share[base + k];
   }

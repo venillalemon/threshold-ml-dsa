@@ -3,7 +3,7 @@
 // Paper steps -> code:
 //   1. rho <- Fcoin; <s>,<e> <- F_smallnormpoly   fcoin_rho (CHEAT), rand_edabits
 //   2. A = ExpandA(rho); <t>_q = A<s>_q + <e>_q   expand_a (CHEAT), matvec_negacyclic
-//      Fopen(<t>_q)                               open_additive_modq + spdz_maccheck
+//      Fopen(<t>_q)                               open_fq_checked (pairwise BDOZ)
 //   3. (t1,t0) = Power2Round(t,d); tr = H(rho,t1) ref_power2round, h256_stub (CHEAT)
 //   4. store (rho,tr,t,t1,t0,<s>_2,<e>_2), pk=(rho,t1)   KeyPair
 //
@@ -69,19 +69,13 @@ inline KeyPair<nP> keygen(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>
 #endif
 
   // 2. <t>_q = A<s>_q + <e>_q, then Fopen(<t>_q) gated by a MACCheck.
-  std::vector<AuthShare> t_share = kp.e.q_share;
-  matvec_negacyclic(kp.A, kp.s.q_share, t_share, K, ELL);
+  std::vector<FqShare<nP>> t_share = kp.e.fq_share;
+  matvec_negacyclic(kp.A, kp.s.fq_share, t_share, K, ELL);
 #ifdef TEST
   timer_lap("A*s + e (local)");
 #endif
 
-  std::vector<uint32_t> t_val(COEFF_COUNT), t_mac(COEFF_COUNT);
-  for (int i = 0; i < COEFF_COUNT; ++i) {
-    t_val[i] = t_share[i].val;
-    t_mac[i] = t_share[i].mac;
-  }
-  kp.t = open_additive_modq(sess.io(), party, t_val);
-  spdz_maccheck(sess.io(), party, dealer.my_alpha, t_mac, kp.t);
+  kp.t = open_fq_checked(sess.io(), party, dealer.my_alpha_f, t_share);
 #ifdef TEST
   timer_lap("open t + MACCheck");
 #endif
@@ -100,20 +94,13 @@ inline KeyPair<nP> keygen(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>
 #ifdef TEST
   // Test-only: open s,e (destroys secrecy — TEST builds only) and check
   // range, t = A*s + e in the clear, and the Power2Round identity.
-  auto open_q_shares = [&](const std::vector<AuthShare>& shares) {
-    std::vector<uint32_t> val(shares.size()), mac(shares.size());
-    for (size_t i = 0; i < shares.size(); ++i) {
-      val[i] = shares[i].val;
-      mac[i] = shares[i].mac;
-    }
-    std::vector<uint32_t> opened = open_additive_modq(sess.io(), party, val);
-    spdz_maccheck(sess.io(), party, dealer.my_alpha, mac, opened);
-    return opened;
+  auto open_q_shares = [&](const std::vector<FqShare<nP>>& shares) {
+    return open_fq_checked(sess.io(), party, dealer.my_alpha_f, shares);
   };
   auto centered = [](uint32_t x) { return x > (uint32_t)Q / 2 ? (int32_t)x - Q : (int32_t)x; };
 
-  const std::vector<uint32_t> opened_s = open_q_shares(kp.s.q_share);
-  const std::vector<uint32_t> opened_e = open_q_shares(kp.e.q_share);
+  const std::vector<uint32_t> opened_s = open_q_shares(kp.s.fq_share);
+  const std::vector<uint32_t> opened_e = open_q_shares(kp.e.fq_share);
   kp.opened_s = opened_s;
   kp.opened_e = opened_e;
   int s_bad = 0, e_bad = 0;
