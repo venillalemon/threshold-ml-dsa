@@ -11,6 +11,8 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 using namespace emp;
 using namespace mldsa;
@@ -31,7 +33,13 @@ int main(int argc, char** argv) {
 
   // Demo-only offline from a common seed (spdz.h FakeDealer): every party's
   // BDOZ slope lives only inside the dealer; protocols see their own slope.
-  FakeDealer<nP> dealer(party, 777);
+  // Seed from the shared port so all parties agree yet each run differs (the
+  // dealer now supplies every correlation, so a fixed seed would make every
+  // attempt identical). Override with EMP_SEED to reproduce a specific run.
+  const char* seed_env = std::getenv("EMP_SEED");
+  const uint32_t seed = seed_env ? (uint32_t)std::strtoul(seed_env, nullptr, 10)
+                                 : (0x9e3779b9u ^ (uint32_t)peer_port());
+  FakeDealer<nP> dealer(party, seed);
 
   const auto keygen_start = clock_start();
   KeyPair<nP> kp = keygen<nP>(bk, party, dealer);

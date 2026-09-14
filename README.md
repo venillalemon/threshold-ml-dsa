@@ -60,7 +60,7 @@ threshold-ml-dsa/
 |---|---|
 | `ref.h` | ML-DSA 参数常量、F_q/R_q 运算、`ref_*` 明文参考实现(FIPS 204)、ExpandA/H/SampleInBall 的 **stub** |
 | `spdz.h` | SPDZ 认证份额 `AuthShare`、open、MACCheck(SPDZ-2 式)、`FakeDealer`(全量 α 的唯一居所) |
-| `edabits.h` | `SharePair` 类型;unsigned/signed/y/Fq 四种 edaBits(**demo cheat**:开 r 后 dealer 拆分) |
+| `edabits.h` | `SharePair` 类型;y/Fq/ring 三种 edaBits,dealer 直接采样并发出算术+布尔一致份额(**demo cheat**,零通信) |
 
 ### src/circuit/ — 布尔电路
 
@@ -74,7 +74,7 @@ threshold-ml-dsa/
 
 | 文件 | 对应论文 | 内容 |
 |---|---|---|
-| `rand.h` | Π_smallnormpoly | daBit 拒绝采样生成 [-η,η] 均匀小范数多项式份额 |
+| `rand.h` | Π_smallnormpoly | dealer 直接采 [-η,η] 小范数份额(算术,无拒绝采样) |
 | `keygen.h` | Π_MLDSA.KeyGen | s/e 采样、开 t + MACCheck、Power2Round,产出 pk 与 `KeyPair` |
 | `prepsign.h` | Π_PrepSign | 离线预处理:采 y/e_w、w = Ay+e_w、A2B、Decompose,返回 (⟨w₀⟩₂, w₁, ⟨y⟩₂) |
 | `sign.h` | Π_MLDSA.Sign | 在线签名(T=1):挑战 c、r₀/z 拒绝电路(只公开判定位)、开 z、MakeHint |
@@ -85,12 +85,17 @@ threshold-ml-dsa/
 
 协议逻辑忠实于论文;以下基础原语是占位实现,替换时协议层不需要改动:
 
-1. **edaBits/daBits**(`infra/edabits.h`):布尔份额抽好后把 r 公开、再由
-   dealer 拆出一致的算术份额。真实现需在不公开 r 的前提下产出份额对
-   (如 MP-SPDZ 的 edaBits 协议);
-2. **SPDZ offline**(`infra/spdz.h` 的 `FakeDealer`):全量 MAC 钥匙 α 由共享
-   种子导出。真 SPDZ 中 α 从不被任何一方重构,认证份额由 MASCOT(OT)或
-   Overdrive(HE)产出;协议层只接触 `my_alpha` 与 `deal()`,替换面已隔离;
+1. **edaBits/daBits**(`infra/edabits.h`):dealer 直接在正确范围内采样(y、
+   R2、R_H、以及小范数 s/e/e_w),一次发出该值的算术(F_q + 环)与 GMW/WRK
+   布尔三种一致份额——**零通信、零 GMW、无拒绝采样**。真实现需在不公开值的
+   前提下产出份额对(如 MP-SPDZ 的 edaBits 协议)。因此 KeyGen 本身不跑任何
+   电路(GMW ANDs = 0);GMW 只用于 Sign 的实际电路(A2B、Decompose、
+   producer)。
+2. **SPDZ / GMW offline**(`infra/spdz.h` 的 `FakeDealer`):全量算术 α 与每方
+   GMW/WRK 的 Δ 都由共享种子确定性导出,dealer 借此伪造一致的布尔认证份额。
+   真实现中 α、Δ 从不被任何一方重构,认证份额由 MASCOT/Overdrive(算术)与
+   真实恶意 COT(布尔)产出;协议层只接触 `deal_*` 和 `my_alpha`/`my_delta`,
+   替换面已隔离;
 3. **MAC 域太小**:MAC 在 F_q(2²³)上,伪造概率 2⁻²³;真实现需扩域或多重 MAC;
 4. **SHAKE 全家**(`infra/ref.h`):ExpandA/H/SampleInBall 用 seed_seq+mt19937
    代替 SHAKE-128/256,均为公开本地计算,换真 Keccak 不改协议消息。

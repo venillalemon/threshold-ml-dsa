@@ -18,6 +18,8 @@
 #ifndef MLDSA_BACKEND_H
 #define MLDSA_BACKEND_H
 
+#include "spdz.h" // mldsa::deterministic_delta (shared with FakeDealer)
+
 #include <emp-ag/gmw.h>
 #include <emp-ag/wrk.h>
 #include <emp-ag/backend/netmp.h>
@@ -28,25 +30,9 @@
 
 namespace mldsa {
 
-// Per-party authentication key with the aShare pinned-bit profile the vendored
-// AuthSharePool enforces (bit0 = 1, bit1 = party==1 ? nP%2 : 1). Delta is a
-// party's PRIVATE secret and needs no agreement; only the two structural bits
-// are fixed. Sampled locally from the party's own PRG.
-template <int nP> inline emp::block make_delta() {
-  emp::block d;
-  emp::PRG prg;
-  prg.random_block(&d, 1);
-  return d;
-}
-template <int nP> inline emp::block pinned_delta(int party) {
-  emp::block d = make_delta<nP>();
-  std::array<uint8_t, 16> raw{};
-  std::memcpy(raw.data(), &d, 16);
-  const uint8_t bit1 = (party == 1) ? (uint8_t)(nP % 2) : (uint8_t)1;
-  raw[0] = (uint8_t)((raw[0] & ~3U) | 1U | (bit1 << 1));
-  std::memcpy(&d, raw.data(), 16);
-  return d;
-}
+// The backend's Delta is the SAME deterministic per-party key the FakeDealer
+// reconstructs (spdz.h), so dealer-fabricated Boolean edaBit shares authenticate
+// under it. Demo cheat: a real deployment keeps Delta private.
 
 // A fixed, party-independent session id. Every party derives the identical
 // block with no communication. This is a demo stand-in for a fresh unpredictable
@@ -66,7 +52,7 @@ public:
 
   Backend(int party, int port, ThreadPool* pool, int triple_ssp = 80)
       : party_(party), pool_(pool), io_(party, port),
-        delta_(pinned_delta<nP>(party)), sid_(demo_session_id()),
+        delta_(deterministic_delta<nP>(party)), sid_(demo_session_id()),
         gmw_(&io_, pool, party, sid_, delta_, triple_ssp) {}
 
   Backend(const Backend&) = delete;

@@ -14,6 +14,7 @@
 
 #include "ref.h"                     // mldsa::Q, fq_* field ops
 #include <emp-ag/backend/netmp.h>    // emp::NetIOMP (vendored WRK/GMW mesh)
+#include <emp-ag/wrk.h>              // emp::wrk::AuthShare (dealer-fabricated Boolean shares)
 #include <emp-tool/emp-tool.h>       // emp::expecting, emp::Hash, emp::block
 
 #include <array>
@@ -457,6 +458,25 @@ inline std::vector<uint32_t> open_xor(NetIOMP<nP>& io, int party,
 // seeded rng, COMPUTES the whole split, and only ever USES its own slot
 // [party] — the visibility a real ⟨·⟩ share would give. NOT how real secret
 // sharing works; a self-consistent, checkable stand-in.
+// Deterministic per-party GMW/WRK authentication key with the aShare pinned-bit
+// profile (bit0 = 1, bit1 = party==1 ? nP%2 : 1). Derived from a FIXED master
+// block so a FakeDealer can reconstruct EVERY party's Delta and fabricate
+// consistent Boolean authenticated shares -- the same demo cheat as the dealer
+// knowing every party's arithmetic slope. A real edaBit protocol keeps Delta
+// private and produces the share pairs without a dealer.
+template <int nP> inline emp::block deterministic_delta(int party) {
+  static const emp::block master = emp::makeBlock(0x6d6c647361447fULL, 0x44656c7461ULL);
+  emp::PRG prg(&master, party);
+  emp::block d;
+  prg.random_block(&d, 1);
+  std::array<uint8_t, 16> raw{};
+  std::memcpy(raw.data(), &d, 16);
+  const uint8_t bit1 = (party == 1) ? (uint8_t)(nP % 2) : (uint8_t)1;
+  raw[0] = (uint8_t)((raw[0] & ~3U) | 1U | (bit1 << 1));
+  std::memcpy(&d, raw.data(), 16);
+  return d;
+}
+
 template <int nP> struct FakeDealer {
   int party;
   std::mt19937 rng;  // shared seed: every party runs the identical stream
@@ -464,6 +484,8 @@ template <int nP> struct FakeDealer {
   RingVal my_alpha_r;                     // this party's own ring slope
   std::array<FqMac, nP + 1> alpha_f{};    // CHEAT: every party's R F_q slopes
   FqMac my_alpha_f{};                     // this party's own F_q slopes
+  std::array<emp::block, nP + 1> deltas{}; // CHEAT: every party's GMW/WRK Delta
+  emp::block my_delta{};                   // this party's own Delta
 
   FakeDealer(int party, uint32_t seed) : party(party), rng(seed) {
     for (int p = 1; p <= nP; ++p)
@@ -473,6 +495,55 @@ template <int nP> struct FakeDealer {
       for (int i = 0; i < FQ_MAC_REP; ++i)
         alpha_f[p][i] = rng() % Q;
     my_alpha_f = alpha_f[party];
+    for (int p = 1; p <= nP; ++p)
+      deltas[p] = deterministic_delta<nP>(p);
+    my_delta = deltas[party];
+  }
+
+  // A uniform value in [0, range) from the shared stream (identical at every
+  // party). Modulo bias is negligible for the demo ranges used here.
+  uint64_t draw_uniform(uint64_t range) {
+    const uint64_t r = ((uint64_t)rng() << 32) | (uint64_t)rng();
+    return range ? r % range : 0;
+  }
+
+  // A 128-bit block from the shared stream (identical at every party).
+  emp::block block_rand() {
+    uint64_t lo = ((uint64_t)rng() << 32) | (uint64_t)rng();
+    uint64_t hi = ((uint64_t)rng() << 32) | (uint64_t)rng();
+    return emp::makeBlock(hi, lo);
+  }
+
+  // Deal an authenticated GMW/WRK Boolean sharing of the low `width` bits of
+  // `value` (little-endian). Every ordered pair (holder i, verifier j) gets a
+  // one-time key K at P_j and MAC K ^ x_i*Delta_j at P_i, so the receiver of an
+  // opening verifies locally -- the same pairwise structure as deal_ring, over
+  // GF(2) with Delta instead of the ring slope. Returns THIS party's shares.
+  emp::wrk::AuthShareVec<nP> deal_bits(uint64_t value, int width) {
+    emp::wrk::AuthShareVec<nP> out((size_t)width);
+    for (int k = 0; k < width; ++k) {
+      const uint8_t x = (uint8_t)((value >> k) & 1);
+      std::array<uint8_t, nP + 1> sh{};
+      uint8_t acc = 0;
+      for (int p = 1; p < nP; ++p) {
+        sh[p] = (uint8_t)(rng() & 1);
+        acc ^= sh[p];
+      }
+      sh[nP] = (uint8_t)(x ^ acc);
+      emp::wrk::AuthShare<nP>& a = out[(size_t)k];
+      a.bit = sh[party];
+      for (int i = 1; i <= nP; ++i)
+        for (int j = 1; j <= nP; ++j) {
+          if (i == j)
+            continue;
+          const emp::block K = block_rand();
+          if (party == j)
+            a.key(emp::wrk::peer_slot(j, i)) = K;
+          if (party == i)
+            a.mac(emp::wrk::peer_slot(i, j)) = K ^ (emp::select_mask[sh[i]] & deltas[j]);
+        }
+    }
+    return out;
   }
 
   // BDOZ over the widened ring: additive shares of v, and for every ordered
