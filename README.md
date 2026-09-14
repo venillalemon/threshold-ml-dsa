@@ -145,7 +145,7 @@ for p in 1 2; do EMP_PORT=17720 ./build/wrk_bridge_test3 $p & done; EMP_PORT=177
   pk: rho[0]=9e3779b9, t1=1536 coefficients | tr[0]=...
   signature: (c, z, h) — ||z||_inf=130731 (< 130994), HW(h)=67 (<= 80)
   setup     42 ms | comm    0.5 MB
-  KeyGen   173 ms | comm    3.6 MB | GMW ANDs 17424
+  KeyGen    15 ms | comm    0.0 MB | GMW ANDs 0
   Sign    1456 ms | comm   77.8 MB | GMW ANDs 398057 | G2(WRK) ANDs 78079
     - offline (no msg)   1425 ms | comm   77.3 MB
     - online  (after msg)  30 ms | comm    0.5 MB | flights 2
