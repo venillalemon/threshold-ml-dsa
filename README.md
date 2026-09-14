@@ -8,14 +8,37 @@ ML-DSA 签名**(验证方无需知道签名是 MPC 产的)。
 拒绝采样失败时返回 (c, ⊥, ⊥),重跑一次 Sign 即可(单次通过率约 20%~35%,
 取决于参数集)。
 
-两个计算域协同工作:
+三个计算域协同工作(**混合安全后端**,见下):
 
-- **算术域 F_q**(q = 8380417):SPDZ 式认证加性份额,负责线性代数
-  (A·y + e 这类矩阵乘,本地免费);
-- **布尔域**:emp-ag 认证混淆电路(WRK 风格,n 方、不诚实多数、恶意安全),
-  负责非线性部分(Decompose、范数比较、拒绝采样判定);
-- 两个域之间靠 **edaBits/daBits**(同一值的算术+布尔一致份额对)和
+- **算术域 F_q**(q = 8380417):BDOZ 成对认证加性份额,负责线性代数
+  (A·y + e 这类矩阵乘,本地免费),开启一律"收到即验、单 flight";
+- **离线布尔域(C_pre)**:**认证 GMW / TinyOT**(真实恶意 COT 三元组),
+  跑挑战前的电路——A2B 恢复 w、Decompose、边界 producer;
+- **在线布尔域(C_post)**:**WRK17b 四行认证混淆**,在**离线阶段**就把电路
+  混淆好、四行表和固定输入标签发给求值方 P1、并把**输出掩码也在离线开给 P1**,
+  于是挑战后只剩**一次 δ_H 开启 + 一次标签投递 + 本地解码**(两个 flight)。
+- 三域之间靠 **edaBits/daBits**(同一值的算术 + GMW 布尔一致份额对)和
   **A2B 转换**(mask-and-open)过桥。
+
+## 混合安全后端(GMW 离线 / WRK 在线)
+
+早期原型把所有布尔电路都放在单一 KRRW 认证混淆会话里,求值后需要广播
+Λ_AND、掷币、commit-open 零检查等多轮交互,在线轮数远超论文目标。现在按论文
+的 offline/online 切分重构:
+
+| 组件 | 文件 | 作用 |
+|---|---|---|
+| `src/infra/backend.h` | `Backend<nP>` | 一个 `NetIOMP` 同时供 GMW(离线电路)、WRK(在线电路)与算术 BDOZ 开启;每方私有 pinned Δ |
+| `src/circuit/wrk_phase2.h` | `wrk_offline` / `wrk_online` | C_post 离线混淆 + 离线开输出掩码;在线一次标签投递后本地解码 |
+| `src/protocol/prepsign.h` | `recover_decompose_program` | A2B + Decompose 编译成一张 GMW 电路 |
+| `src/protocol/sign_2round.h` | `producer_program` | 边界 producer 编译成一张 GMW 电路;C_post 走 WRK 桥 |
+| `third_party/emp-ag/` | `emp::gmw` / `emp::wrk` | vendored WRK 四行 + 认证 GMW 后端(依赖 emp-tool / emp-ot) |
+
+**状态**:两轮模式(`SLOT=0`,即论文 main.pdf 实现)已完整跑通并验证——
+2/3 方 ML-DSA-44 下 KeyGen/Decompose 自检 0 错,电路判定与明文一致,产出的
+(c,z,h) 通过真实 ML-DSA 验证;TAMPER_C 在 checked open 处 abort;在线 2 个
+flight。**slot 模式(`SLOT=1`,sign.h)尚未迁移**到新后端(它的 online 路由
+输入 Dh 是"秘密 late 输入",需要给 WRK 桥加一条在线 masked-open 安装路径)。
 
 ## 仓库结构
 
@@ -74,19 +97,19 @@ threshold-ml-dsa/
 
 ## 依赖与安装
 
-- C++20 编译器、CMake ≥ 3.25、OpenSSL(emp-tool 的依赖)
-- **emp 三件套**,均 `cmake --install` 到标准前缀(默认 /usr/local):
-  - [emp-tool](https://github.com/emp-toolkit/emp-tool)(基础:NetIO、block、PRG)
-  - [emp-ot](https://github.com/emp-toolkit/emp-ot)(OT 扩展)
-  - **emp-ag**
+- C++20 编译器、CMake ≥ 3.25、OpenSSL
+- **emp-tool** 和 **emp-ot** `cmake --install` 到标准前缀(默认 /usr/local):
+  - [emp-tool](https://github.com/emp-toolkit/emp-tool)(基础:NetIO、block、PRG、电路 IR)
+  - [emp-ot](https://github.com/emp-toolkit/emp-ot)(OT 扩展:Ferret / SoftSpoken / IKNP)
+- **WRK/GMW 后端已 vendored 在 `third_party/emp-ag/`**,由本仓库的
+  CMake `add_subdirectory` 带出 `emp-ag::gmw`(自动依赖 emp-tool / emp-ot),
+  无需单独安装。
 
-每个库的安装方式相同:
+emp-tool / emp-ot 安装方式相同:
 
 ```bash
 cmake -S . -B build && cmake --build build -j && sudo cmake --install build
 ```
-
-CMakeLists 里 `find_package(emp-ag REQUIRED)` 会自动带出 emp-tool/emp-ot。
 
 ## 跑
 
@@ -99,23 +122,34 @@ make n=3 TEST=1 TAMPER_C=1   # 对抗测试:party 1 篡改一个 share,MACCheck 
 make clean
 ```
 
+默认走两轮模式(`SLOT=0`);slot 模式尚未迁移(见上「混合安全后端」)。
 端口每次随机(避开上一轮 TIME_WAIT);要固定就 `PORT=16400`。
+
+后端自身还有独立联网自检(2/3/5 方的 GMW COT+open、`gmw.evaluate`、
+`wrk_offline`/`wrk_online`),见 `tests/`:
+
+```bash
+cmake -S . -B build -DMLDSA_TESTS=ON -DMLDSA_DRIVER=OFF && cmake --build build -j
+# 每方一进程,共享 EMP_PORT,例如 3 方:
+for p in 1 2; do EMP_PORT=17720 ./build/wrk_bridge_test3 $p & done; EMP_PORT=17720 ./build/wrk_bridge_test3 3
+```
 
 成功输出(绿色为完整签名;红色 `(c, bot, bot)` 是 T=1 下正常的拒绝采样,重跑即可):
 
 ```
   pk: rho[0]=9e3779b9, t1=1536 coefficients | tr[0]=...
-  signature: (c, z, h) — ||z||_inf=523576 (< 524092), HW(h)=45 (<= 55)
-  setup     14.2 ms | comm    0.2 MB
-  KeyGen   343.6 ms | comm    7.0 MB | ANDs 17424
-  Sign    2021.6 ms | comm  350.3 MB | ANDs 1454736
-STATS np=3 param=ML-DSA-65 ...
+  signature: (c, z, h) — ||z||_inf=130731 (< 130994), HW(h)=67 (<= 80)
+  setup     42 ms | comm    0.5 MB
+  KeyGen   173 ms | comm    3.6 MB | GMW ANDs 17424
+  Sign    1456 ms | comm   77.8 MB | GMW ANDs 398057 | G2(WRK) ANDs 78079
+    - offline (no msg)   1425 ms | comm   77.3 MB
+    - online  (after msg)  30 ms | comm    0.5 MB | flights 2
+STATS np=2 param=ML-DSA-65 slot=0 ...
   KeyGen + Sign complete
 ```
 
-时间/AND 数/通信量都按阶段拆分(通信量是本方发+收的字节数);`STATS` 行是
-同一组数字的机器可读版,供基准脚本 grep。被拒绝的运行 Sign 开销更小
-(r₀ 拒绝后跳过 z 电路,AND 数约为接受运行的 60%)。
+时间/通信量按 **离线 / 在线** 拆分:重活(GMW 三元组、C_post 混淆)全在离线,
+在线只有 2 个 flight。`STATS` 行是机器可读版,供基准脚本 grep。
 
 TEST=1 会额外打印每步自检:KeyGen 的 t = A·s+e 明文比对与 Power2Round 恒等式、
 PrepSign 的 Decompose 对 FIPS oracle、Sign 的 r₀/z 电路对明文逐位比对,

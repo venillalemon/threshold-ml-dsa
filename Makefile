@@ -19,8 +19,9 @@ p     ?= 65
 TEST  ?= 0
 # 编译 adversary:party 1 在打开前修改一个 c share
 TAMPER_C ?= 0
-# 1 = slot-restricted (sign.h), 0 = two-round baseline (sign_2round.h)
-SLOT  ?= 1
+# 1 = slot-restricted (sign.h), 0 = two-round baseline (sign_2round.h).
+# NOTE: slot mode is being migrated onto the GMW/WRK backend; use SLOT=0 for now.
+SLOT  ?= 0
 # 环认证的统计安全参数 sigma(论文取 128)
 SIGMA ?= 128
 # 端口。随机取,避开上一次残留在 TIME_WAIT 里的
@@ -64,7 +65,8 @@ configure:
 	       -DMLDSA_PARTIES="$(PARTIES)" -DMLDSA_PARAM=$(PARAM) \
 	       -DMLDSA_TEST=$(if $(filter 1,$(TEST)),ON,OFF) \
 	       -DMLDSA_TAMPER_C=$(if $(filter 1,$(TAMPER_C)),ON,OFF) \
-	       -DMLDSA_SLOT=$(if $(filter 1,$(SLOT)),ON,OFF) -DMLDSA_SIGMA=$(SIGMA) >/dev/null
+	       -DMLDSA_SLOT=$(if $(filter 1,$(SLOT)),ON,OFF) -DMLDSA_SIGMA=$(SIGMA) \
+	       -DMLDSA_DRIVER=ON -DMLDSA_TESTS=OFF >/dev/null
 	@# p=/TEST= 换配置只改 -D,cmake 的 Makefile 生成器靠 mtime 判断要不要重编,
 	@# 而重新生成的 flags.make 可能和上一次的 .o 落在同一秒 —— make 只在依赖
 	@# 严格更新时才动手,于是静默沿用旧二进制。配置真变了就删掉 .o。
