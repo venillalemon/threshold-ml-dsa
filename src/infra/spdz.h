@@ -12,8 +12,9 @@
 #ifndef MLDSA_SPDZ_H
 #define MLDSA_SPDZ_H
 
-#include "ref.h"           // mldsa::Q, fq_* field ops
-#include <emp-ag/emp-ag.h> // emp::NetIOMP, emp::expecting
+#include "ref.h"                     // mldsa::Q, fq_* field ops
+#include <emp-ag/backend/netmp.h>    // emp::NetIOMP (vendored WRK/GMW mesh)
+#include <emp-tool/emp-tool.h>       // emp::expecting, emp::Hash, emp::block
 
 #include <array>
 #include <cstdint>

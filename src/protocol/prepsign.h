@@ -1,172 +1,160 @@
-// src/protocol/prepsign.h — Pi_PrepSign orchestration.
+// src/protocol/prepsign.h — Pi_PrepSign, offline (pre-challenge).
+//
+// Arithmetic (edaBits, w = A*y + e_w, the field opening of delta_w = w + R2) is
+// BDOZ over F_q via the FakeDealer, exactly as before. The Boolean half — the
+// A2B recovery of w and its Decompose — is now ONE compiled circuit evaluated
+// under authenticated GMW (the offline circuit domain, C_ad below), producing
+// public w1 and retained authenticated shares of w0 that feed the boundary
+// producers in sign.h / sign_2round.h.
 #ifndef MLDSA_PREPSIGN_H
 #define MLDSA_PREPSIGN_H
 
-#include "a2b.h"
-#include "decompose.h"
+#include "a2b.h"        // sub_modq kernel
+#include "decompose.h"  // decompose<PARAM>, OW0, OW1
 #include "edabits.h"
+#include "phase1_util.h"
 #include "rand.h"
 #include "spdz.h"
-#include <emp-ag/emp-ag.h>
 
 #include <cstdint>
 #include <cstdio>
-#include <random>
-#include <utility>
 #include <vector>
 
 namespace mldsa {
 
 #ifdef TEST
-// TEST-only oracle: plaintext values opened by the latest prepsign() call, so
-// downstream TEST checks (sign.h) can cross-check circuits against plaintext.
 inline std::vector<uint32_t> test_opened_y, test_opened_w;
 #endif
 
-// PrepSign outputs. w0_2 remains a vector of secret AG circuit values so it can
-// be consumed directly by the next circuit. y_2 is the authenticated Boolean
-// sharing returned by y_edabits (the Y_WIDTH-bit two's-complement encoding of
-// y-1). w1 is public at every party.
-template <int nP> using PrepSignCtx = typename emp::AGMPCSession<nP>::ctx_t;
+// C_ad: per coefficient, w = sub_modq(c, R2) then (w1, w0) = Decompose(w).
+// Inputs  [R2 : L*COEFF_COUNT][c : L*COEFF_COUNT]  (c enters as public bits).
+// Outputs [w1 : OW1*COEFF_COUNT][w0 : OW0*COEFF_COUNT].
+inline const emp::circuit::BooleanProgram& recover_decompose_program() {
+  static const emp::circuit::BooleanProgram prog = [] {
+    emp::RecordCtx ctx;
+    const uint32_t base = ctx.external_input((uint32_t)(2 * L * COEFF_COUNT));
+    const uint32_t c_base = base + (uint32_t)(L * COEFF_COUNT);
+    std::vector<emp::UInt_T<emp::RecordCtx, OW1>> w1s;
+    std::vector<emp::UInt_T<emp::RecordCtx, OW0>> w0s;
+    w1s.reserve(COEFF_COUNT);
+    w0s.reserve(COEFF_COUNT);
+    for (int i = 0; i < COEFF_COUNT; ++i) {
+      auto r2 = in_uint<L>(ctx, base + (uint32_t)(L * i));
+      auto c = in_uint<L>(ctx, c_base + (uint32_t)(L * i));
+      auto w = sub_modq(ctx, c, r2);
+      auto d = decompose<PARAM>(ctx, w);
+      w1s.push_back(d.w1);
+      w0s.push_back(d.w0);
+    }
+    std::vector<emp::RecordCtx::Wire> outw;
+    outw.reserve((size_t)(OW1 + OW0) * COEFF_COUNT);
+    for (auto& v : w1s) {
+      emp::RecordCtx::Wire w[OW1];
+      v.pack_wires(w);
+      outw.insert(outw.end(), w, w + OW1);
+    }
+    for (auto& v : w0s) {
+      emp::RecordCtx::Wire w[OW0];
+      v.pack_wires(w);
+      outw.insert(outw.end(), w, w + OW0);
+    }
+    ctx.finish(outw);
+    return std::move(ctx.prog);
+  }();
+  return prog;
+}
 
-// A is the public matrix ExpandA(rho) from KeyGen (keygen.h), flattened
-// K x ELL x N. The paper has Sign recompute it locally from rho; here the
-// caller passes KeyPair::A.
+template <int nP> struct PrepSignOut {
+  emp::wrk::ShareVec<nP> w0_2;         // OW0-bit GMW shares per coefficient
+  SharePair<nP, Y_WIDTH, false> y;     // <y>: Boolean (y-1) + arithmetic
+  std::vector<uint32_t> w1;            // public HighBits
+};
+
 template <int nP>
-inline void prepsign(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& dealer,
-                     const std::vector<uint32_t>& A,
-                     std::vector<emp::UInt_T<PrepSignCtx<nP>, OW0>>& w0_2,
-                     SharePair<nP, Y_WIDTH, false>& y_out, std::vector<uint32_t>& w1) {
-  using Ctx = PrepSignCtx<nP>;
-  using U23 = emp::UInt_T<Ctx, L>;
-
-#ifdef TEST
-  auto lap_start = emp::clock_start();
-  auto timer_lap = [&](const char* label) {
-    if (party == 1)
-      std::printf("  [timer] %-20s %8.1f ms\n", label, emp::time_from(lap_start) / 1000.0);
-    lap_start = emp::clock_start();
-  };
-#endif
+inline PrepSignOut<nP> prepsign(Backend<nP>& bk, int party, FakeDealer<nP>& dealer,
+                                const std::vector<uint32_t>& A) {
+  PrepSignOut<nP> out;
 
   // <y>_2,<y>_q and <e_w>_q. <e_w>_2 is intentionally unused.
-  SharePair<nP, Y_WIDTH, false> y = y_edabits<nP, Y_WIDTH>(sess, party, dealer, Y_COEFF_COUNT);
-#ifdef TEST
-  timer_lap("y edabits");
-#endif
-  SharePair<nP, (ETA == 2 ? 3 : 4), false> ew =
-      rand_edabits<nP, ETA, COEFF_COUNT>(sess, party, dealer);
-#ifdef TEST
-  timer_lap("e_w edabits");
-#endif
+  out.y = y_edabits<nP, Y_WIDTH>(bk, party, dealer, Y_COEFF_COUNT);
+  SharePair<nP, (ETA == 2 ? 3 : 4), false> ew = rand_edabits<nP, ETA, COEFF_COUNT>(bk, party, dealer);
 
 #ifdef TEST
-  // Test-only range checks; every opened arithmetic vector is MAC-checked.
-  auto open_q_shares = [&](const std::vector<FqShare<nP>>& shares) {
-    return open_fq_checked(sess.io(), party, dealer.my_alpha_f, shares);
+  auto open_q = [&](const std::vector<FqShare<nP>>& s) {
+    return open_fq_checked(bk.io(), party, dealer.my_alpha_f, s);
   };
   auto centered = [](uint32_t x) { return x > (uint32_t)Q / 2 ? (int32_t)x - Q : (int32_t)x; };
-
-  const std::vector<uint32_t> opened_y = open_q_shares(y.fq_share);
-  int y_min = GAMMA1 + 1, y_max = -GAMMA1 - 1, y_bad = 0;
-  for (uint32_t x : opened_y) {
-    const int value = centered(x);
-    y_min = value < y_min ? value : y_min;
-    y_max = value > y_max ? value : y_max;
-    y_bad += value <= -GAMMA1 || value > GAMMA1;
-  }
-
-  const std::vector<uint32_t> opened_ew = open_q_shares(ew.fq_share);
-  int ew_min = ETA + 1, ew_max = -ETA - 1, ew_bad = 0;
-  for (uint32_t x : opened_ew) {
-    const int value = centered(x);
-    ew_min = value < ew_min ? value : ew_min;
-    ew_max = value > ew_max ? value : ew_max;
-    ew_bad += value < -ETA || value > ETA;
-  }
-  if (party == 1) {
-    std::printf("  y range [%d, %d], %d outside (-%d, %d]\n", y_min, y_max, y_bad, GAMMA1, GAMMA1);
-    std::printf("  e_w range [%d, %d], %d outside [-%d, %d]\n", ew_min, ew_max, ew_bad, ETA, ETA);
-  }
-  emp::expecting(y_bad == 0, "PrepSign test: opened y coefficient outside (-GAMMA1,GAMMA1]");
-  emp::expecting(ew_bad == 0, "PrepSign test: opened e_w coefficient outside [-ETA,ETA]");
-  timer_lap("test range checks");
+  const std::vector<uint32_t> opened_y = open_q(out.y.fq_share);
+  const std::vector<uint32_t> opened_ew = open_q(ew.fq_share);
+  int y_bad = 0, ew_bad = 0;
+  for (uint32_t x : opened_y)
+    y_bad += centered(x) <= -GAMMA1 || centered(x) > GAMMA1;
+  for (uint32_t x : opened_ew)
+    ew_bad += centered(x) < -ETA || centered(x) > ETA;
+  emp::expecting(y_bad == 0, "PrepSign test: y out of (-GAMMA1,GAMMA1]");
+  emp::expecting(ew_bad == 0, "PrepSign test: e_w out of [-ETA,ETA]");
 #endif
 
-  // <w>_q=A<y>_q+<e_w>_q in F_q[x]/(x^N+1).
+  // <w>_q = A<y>_q + <e_w>_q.
   std::vector<FqShare<nP>> w_share = ew.fq_share;
-  matvec_negacyclic(A, y.fq_share, w_share, K, ELL); // add A*y onto e_w
-#ifdef TEST
-  timer_lap("A*y + e_w (local)");
-#endif
+  matvec_negacyclic(A, out.y.fq_share, w_share, K, ELL);
 
-  // <w>_q -> <w>_2 via F_A2B (a2b.h: mask with an edaBit r, open c = w + r
-  // under a MACCheck, recompute w = c - r inside the circuit).
-  std::vector<U23> w_2 = a2b<nP>(sess, party, dealer, w_share);
-#ifdef TEST
-  timer_lap("A2B");
-#endif
-
-  // Decompose using AG
-  std::vector<emp::UInt_T<Ctx, OW1>> w1_wires;
-  w1_wires.reserve(COEFF_COUNT);
-  std::vector<emp::UInt_T<Ctx, OW0>> w0_wires;
-  w0_wires.reserve(COEFF_COUNT);
-  for (int i = 0; i < COEFF_COUNT; ++i) {
-    auto d = decompose<PARAM>(sess.ctx(), w_2[i]);
-    w1_wires.push_back(d.w1);
-    w0_wires.push_back(d.w0);
-  }
-#ifdef TEST
-  timer_lap("decompose circuit");
-#endif
-
-  // One batched reveal for all of w1 (one decode round, not COEFF_COUNT).
-  using W1V = emp::BitVec_T<Ctx, COEFF_COUNT * OW1>;
-  std::vector<typename Ctx::Wire> w1w((size_t)COEFF_COUNT * OW1);
+  // A2B mask R2, and the checked field open c = w + R2.
+  SharePair<nP, L, true> r2 = Fq_edabits<nP, L>(bk, party, dealer, COEFF_COUNT);
+  std::vector<FqShare<nP>> c_share((size_t)COEFF_COUNT);
   for (int i = 0; i < COEFF_COUNT; ++i)
-    w1_wires[(size_t)i].pack_wires(&w1w[(size_t)i * OW1]);
-  const auto public_w1 = sess.reveal(W1V::from_wires(sess.ctx(), w1w.data()), emp::PUBLIC);
-  emp::expecting(public_w1.has_value(), "PrepSign: public w1 reveal failed");
-  w1.resize(COEFF_COUNT);
+    c_share[(size_t)i] = w_share[(size_t)i] + r2.fq_share[(size_t)i];
+#ifdef TAMPER_C
+  if (party == 1 && COEFF_COUNT > 0)
+    c_share[0].val ^= 1;
+#endif
+  const std::vector<uint32_t> c = open_fq_checked(bk.io(), party, dealer.my_alpha_f, c_share);
+
+  // C_ad inputs: [R2 boolean bits][c public bits].
+  emp::wrk::ShareVec<nP> in;
+  in.reserve((size_t)2 * L * COEFF_COUNT);
+  in.insert(in.end(), r2.two_share.begin(), r2.two_share.end());
+  for (int i = 0; i < COEFF_COUNT; ++i)
+    push_public_word(bk, in, c[(size_t)i], L);
+
+  auto outs = bk.gmw().evaluate(recover_decompose_program(), in);
+  emp::expecting((int)outs.size() == (OW1 + OW0) * COEFF_COUNT, "prepsign: C_ad output width");
+
+  // Open w1; retain w0 shares.
+  emp::wrk::ShareVec<nP> w1shares(outs.begin(), outs.begin() + (size_t)OW1 * COEFF_COUNT);
+  const std::vector<uint8_t> w1bits = bk.gmw().open(w1shares, "prepsign-w1");
+  out.w1.assign((size_t)COEFF_COUNT, 0);
   for (int i = 0; i < COEFF_COUNT; ++i) {
     uint32_t v = 0;
     for (int k = 0; k < OW1; ++k)
-      v |= (uint32_t)public_w1.value()[(size_t)i * OW1 + k] << k;
-    w1[i] = v;
+      v |= (uint32_t)w1bits[(size_t)(i * OW1 + k)] << k;
+    out.w1[(size_t)i] = v;
   }
-#ifdef TEST
-  timer_lap("w1 reveal");
-#endif
+  out.w0_2.assign(outs.begin() + (size_t)OW1 * COEFF_COUNT, outs.end());
 
 #ifdef TEST
-  // Test oracle input. This opening does not exist in the protocol build.
-  std::vector<int32_t> opened_w0(COEFF_COUNT);
-  for (int i = 0; i < COEFF_COUNT; ++i) {
-    const auto public_w0 = sess.reveal(w0_wires[i], emp::PUBLIC);
-    emp::expecting(public_w0.has_value(), "PrepSign test: public w0 reveal failed");
-    const int32_t value = (int32_t)public_w0.value();
-    opened_w0[i] = value - ((value >> (OW0 - 1)) << OW0);
-  }
-  const std::vector<uint32_t> opened_w = open_q_shares(w_share);
+  const std::vector<uint32_t> opened_w = open_q(w_share);
+  emp::wrk::ShareVec<nP> w0shares(outs.begin() + (size_t)OW1 * COEFF_COUNT, outs.end());
+  const std::vector<uint8_t> w0bits = bk.gmw().open(w0shares, "prepsign-w0-test");
   int bad = 0;
   for (int i = 0; i < COEFF_COUNT; ++i) {
-    int32_t expected_w1, expected_w0;
-    ref_decompose((int32_t)opened_w[i], G2, expected_w1, expected_w0);
-    if ((int32_t)w1[i] != expected_w1 || opened_w0[i] != expected_w0)
+    int32_t w1e, w0e;
+    ref_decompose((int32_t)opened_w[(size_t)i], G2, w1e, w0e);
+    int32_t w0v = 0;
+    for (int k = 0; k < OW0; ++k)
+      w0v |= (int32_t)w0bits[(size_t)(i * OW0 + k)] << k;
+    w0v -= (w0v >> (OW0 - 1)) << OW0; // sign-extend two's complement
+    if ((int32_t)out.w1[(size_t)i] != w1e || w0v != w0e)
       ++bad;
   }
   if (party == 1)
-    std::printf("%s  nP=%d  %d coefficients  ->  %d wrong\n", param_name(PARAM), nP,
-                COEFF_COUNT, bad);
+    std::printf("%s  nP=%d  %d coefficients  ->  %d wrong\n", param_name(PARAM), nP, COEFF_COUNT, bad);
   emp::expecting(bad == 0, "PrepSign test: w0/w1 differ from FIPS Decompose");
   test_opened_y = opened_y;
   test_opened_w = opened_w;
-  timer_lap("test w0/w1 oracle");
 #endif
 
-  w0_2 = std::move(w0_wires);
-  y_out = std::move(y);
+  return out;
 }
 
 } // namespace mldsa

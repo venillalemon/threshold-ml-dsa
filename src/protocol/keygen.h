@@ -15,7 +15,7 @@
 #include "rand.h"
 #include "ref.h"
 #include "spdz.h"
-#include <emp-ag/emp-ag.h>
+#include "backend.h"
 
 #include <array>
 #include <cstdint>
@@ -42,7 +42,7 @@ template <int nP> struct KeyPair {
 };
 
 template <int nP>
-inline KeyPair<nP> keygen(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& dealer) {
+inline KeyPair<nP> keygen(Backend<nP>& bk, int party, FakeDealer<nP>& dealer) {
   KeyPair<nP> kp;
 
 #ifdef TEST
@@ -59,11 +59,11 @@ inline KeyPair<nP> keygen(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>
   expand_a(kp.rho, kp.A);
 
   // <s>: ell polynomials, <e>: k polynomials, both eta-small (F_smallnormpoly).
-  kp.s = rand_edabits<nP, ETA, Y_COEFF_COUNT>(sess, party, dealer);
+  kp.s = rand_edabits<nP, ETA, Y_COEFF_COUNT>(bk, party, dealer);
 #ifdef TEST
   timer_lap("s smallnormpoly");
 #endif
-  kp.e = rand_edabits<nP, ETA, COEFF_COUNT>(sess, party, dealer);
+  kp.e = rand_edabits<nP, ETA, COEFF_COUNT>(bk, party, dealer);
 #ifdef TEST
   timer_lap("e smallnormpoly");
 #endif
@@ -75,7 +75,7 @@ inline KeyPair<nP> keygen(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>
   timer_lap("A*s + e (local)");
 #endif
 
-  kp.t = open_fq_checked(sess.io(), party, dealer.my_alpha_f, t_share);
+  kp.t = open_fq_checked(bk.io(), party, dealer.my_alpha_f, t_share);
 #ifdef TEST
   timer_lap("open t + MACCheck");
 #endif
@@ -95,7 +95,7 @@ inline KeyPair<nP> keygen(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>
   // Test-only: open s,e (destroys secrecy — TEST builds only) and check
   // range, t = A*s + e in the clear, and the Power2Round identity.
   auto open_q_shares = [&](const std::vector<FqShare<nP>>& shares) {
-    return open_fq_checked(sess.io(), party, dealer.my_alpha_f, shares);
+    return open_fq_checked(bk.io(), party, dealer.my_alpha_f, shares);
   };
   auto centered = [](uint32_t x) { return x > (uint32_t)Q / 2 ? (int32_t)x - Q : (int32_t)x; };
 

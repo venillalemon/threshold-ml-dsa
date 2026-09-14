@@ -33,14 +33,17 @@
 #ifndef MLDSA_SIGN_2ROUND_H
 #define MLDSA_SIGN_2ROUND_H
 
+#include "backend.h"
 #include "circuit.h"
 #include "edabits.h"
 #include "keygen.h"
+#include "phase1_util.h"
 #include "prepsign.h"
 #include "ref.h"
 #include "spdz.h"
-#include <emp-ag/emp-ag.h>
+#include "wrk_phase2.h"
 #include <emp-tool/circuits/frontend/frontend.h>
+#include <emp-tool/ir/context/record.h>
 
 #include <array>
 #include <cstdint>
@@ -51,6 +54,7 @@
 
 namespace mldsa {
 
+constexpr int M_TOTAL = Y_COEFF_COUNT + COEFF_COUNT; // response + low-bit positions
 constexpr int HALF = 1 << (RING_K - 1);
 constexpr int64_t SPAN_Z = 2 * (int64_t)GAMMA1;    // U^z in [0, SPAN_Z)
 constexpr int64_t SPAN_W = 2 * (int64_t)G2;        // U^w in [0, SPAN_W)
@@ -227,6 +231,79 @@ inline const auto& phase2_circuit() {
   return c;
 }
 
+// The compiled C_post program (fixed inputs B||Mz||Mw, late public P = delta_H).
+inline const emp::circuit::BooleanProgram& phase2_program() { return phase2_circuit().program(); }
+
+// C_prod: the pre-challenge boundary producers, as one offline GMW circuit.
+// Inputs  [y(=v) : Y_WIDTH*Y_COEFF_COUNT][w0 : OW0*COEFF_COUNT]
+//         [R_H^z : RING_K*Y_COEFF_COUNT][R_H^w : RING_K*COEFF_COUNT].
+// Outputs [B : BW][Mz : MZW][Mw : MWW]  (retained as C_post's fixed inputs).
+inline const emp::circuit::BooleanProgram& producer_program() {
+  using Ctx = emp::RecordCtx;
+  using Bit = emp::Bit_T<Ctx>;
+  using Wire = Ctx::Wire;
+  static const emp::circuit::BooleanProgram prog = [] {
+    Ctx ctx;
+    const uint32_t y_base = ctx.external_input(
+        (uint32_t)(Y_WIDTH * Y_COEFF_COUNT + OW0 * COEFF_COUNT + RING_K * M_TOTAL));
+    const uint32_t w0_base = y_base + (uint32_t)(Y_WIDTH * Y_COEFF_COUNT);
+    const uint32_t rhz_base = w0_base + (uint32_t)(OW0 * COEFF_COUNT);
+    const uint32_t rhw_base = rhz_base + (uint32_t)(RING_K * Y_COEFF_COUNT);
+    std::vector<Wire> outB, outMz, outMw;
+    outB.reserve(BW);
+    outMz.reserve(MZW);
+    outMw.reserve(MWW);
+    {
+      Bit v[Y_WIDTH], U[Y_WIDTH], R[RING_K], B[Y_WIDTH], M[RING_K];
+      for (int idx = 0; idx < Y_COEFF_COUNT; ++idx) {
+        for (int k = 0; k < Y_WIDTH; ++k)
+          v[k] = wire_bit(ctx, y_base + (uint32_t)(Y_WIDTH * idx + k));
+        for (int k = 0; k < Y_WIDTH; ++k) // U = gamma1 - y = ~v, top bit restored
+          U[k] = k < Y_WIDTH - 1 ? !v[k] : v[k];
+        for (int k = 0; k < RING_K; ++k)
+          R[k] = wire_bit(ctx, rhz_base + (uint32_t)(RING_K * idx + k));
+        window_producer<Y_WIDTH, SPAN_Z>(ctx, U, R, B, M);
+        for (int k = 0; k < Y_WIDTH; ++k) {
+          Wire w;
+          B[k].pack_wires(&w);
+          outB.push_back(w);
+        }
+        for (int k = 0; k < RING_K; ++k) {
+          Wire w;
+          M[k].pack_wires(&w);
+          outMz.push_back(w);
+        }
+      }
+    }
+    {
+      Bit w0b[OW0], nw0[OW0], U[OW0], R[RING_K], M[RING_K];
+      for (int idx = 0; idx < COEFF_COUNT; ++idx) {
+        for (int k = 0; k < OW0; ++k)
+          w0b[k] = wire_bit(ctx, w0_base + (uint32_t)(OW0 * idx + k));
+        for (int k = 0; k < OW0; ++k)
+          nw0[k] = !w0b[k];
+        add_const_ripple<OW0>(ctx, U, nw0, (uint64_t)G2, true); // U = gamma2 - w0
+        for (int k = 0; k < RING_K; ++k)
+          R[k] = wire_bit(ctx, rhw_base + (uint32_t)(RING_K * idx + k));
+        window_producer<OW0, SPAN_W>(ctx, U, R, static_cast<Bit*>(nullptr), M);
+        for (int k = 0; k < RING_K; ++k) {
+          Wire w;
+          M[k].pack_wires(&w);
+          outMw.push_back(w);
+        }
+      }
+    }
+    std::vector<Wire> outs;
+    outs.reserve((size_t)(BW + MZW + MWW));
+    outs.insert(outs.end(), outB.begin(), outB.end());
+    outs.insert(outs.end(), outMz.begin(), outMz.end());
+    outs.insert(outs.end(), outMw.begin(), outMw.end());
+    ctx.finish(outs);
+    return std::move(ctx.prog);
+  }();
+  return prog;
+}
+
 // No-op default for sign()'s after_prepsign hook (see below).
 struct NoopHook {
   void operator()() const {}
@@ -238,15 +315,9 @@ struct NoopHook {
 // number of online synchronization barriers; `g2_ands_out` the AND count of the
 // prepared post-challenge circuit.
 template <int nP, class Hook = NoopHook>
-inline Signature sign(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& dealer,
-                      KeyPair<nP>& kp, const std::vector<uint32_t>& msg,
-                      Hook after_prepsign = Hook{}, int64_t* online_rounds_out = nullptr,
-                      int64_t* g2_ands_out = nullptr) {
-  using Ctx = typename emp::AGMPCSession<nP>::ctx_t;
-  using Bit = emp::Bit_T<Ctx>;
-  using Wire = typename Ctx::Wire;
-  using UR = emp::UInt_T<Ctx, RING_K>;
-
+inline Signature sign(Backend<nP>& bk, int party, FakeDealer<nP>& dealer, KeyPair<nP>& kp,
+                      const std::vector<uint32_t>& msg, Hook after_prepsign = Hook{},
+                      int64_t* online_rounds_out = nullptr, int64_t* g2_ands_out = nullptr) {
   Signature sig;
 
 #ifdef TEST
@@ -259,77 +330,44 @@ inline Signature sign(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& de
 #endif
 
   // ---- offline ---------------------------------------------------------------
-  // 1a. F_PrepSign -> (<w0>_2 wires, <y> shares, w1 public), T = 1.
-  std::vector<emp::UInt_T<Ctx, OW0>> w0_2;
-  SharePair<nP, Y_WIDTH, false> y;
-  std::vector<uint32_t> w1;
-  const uint64_t and_a0 = sess.num_and();
-  prepsign<nP>(sess, party, dealer, kp.A, w0_2, y, w1);
-  const uint64_t and_a1 = sess.num_and();
+  // 1a. F_PrepSign -> (<w0> GMW shares, <y>, w1 public), T = 1.
+  const uint64_t and_a0 = bk.gmw().ands_evaluated;
+  PrepSignOut<nP> ps = prepsign<nP>(bk, party, dealer, kp.A);
+  const uint64_t and_a1 = bk.gmw().ands_evaluated;
 #ifdef TEST
   timer_lap("prepsign");
 #endif
 
   // Ring eDaBits (R^, r) for every response and low-bit position.
-  RingEdabits<nP> rz = ring_edabits<nP, RING_K>(sess, party, dealer, Y_COEFF_COUNT);
-  RingEdabits<nP> rw = ring_edabits<nP, RING_K>(sess, party, dealer, COEFF_COUNT);
+  RingEdabits<nP> rz = ring_edabits<nP, RING_K>(bk, party, dealer, Y_COEFF_COUNT);
+  RingEdabits<nP> rw = ring_edabits<nP, RING_K>(bk, party, dealer, COEFF_COUNT);
 
-  // Phase 1: Boolean boundary producers -> B, M^z, M^w (stay authenticated).
-  std::vector<Wire> bw((size_t)BW), mzw((size_t)MZW), mww((size_t)MWW);
-  {
-    Bit U[Y_WIDTH], R[RING_K], B[Y_WIDTH], M[RING_K];
-    for (int idx = 0; idx < Y_COEFF_COUNT; ++idx) {
-      // <y>_2 stores v = y - 1 (two's complement); U = gamma1 - y = (gamma1-1) - v
-      // = ~v with the top bit restored -- pure rewiring.
-      const auto v = sess.template adopt_authenticated_input<emp::UInt_T<Ctx, Y_WIDTH>>(
-          &y.two_share[(size_t)Y_WIDTH * idx]);
-      for (int k = 0; k < Y_WIDTH; ++k)
-        U[k] = k < Y_WIDTH - 1 ? !v[k] : v[k];
-      const auto r = sess.template adopt_authenticated_input<UR>(&rz.two_share[(size_t)RING_K * idx]);
-      for (int k = 0; k < RING_K; ++k)
-        R[k] = r[k];
-      window_producer<Y_WIDTH, SPAN_Z>(sess.ctx(), U, R, B, M);
-      for (int k = 0; k < Y_WIDTH; ++k)
-        B[k].pack_wires(&bw[(size_t)idx * Y_WIDTH + k]);
-      for (int k = 0; k < RING_K; ++k)
-        M[k].pack_wires(&mzw[(size_t)idx * RING_K + k]);
-    }
-  }
-  {
-    Bit w0b[OW0], nw0[OW0], U[OW0], R[RING_K], M[RING_K];
-    for (int idx = 0; idx < COEFF_COUNT; ++idx) {
-      unpack_bits<OW0>(w0_2[(size_t)idx], w0b);
-      for (int k = 0; k < OW0; ++k)
-        nw0[k] = !w0b[k];
-      add_const_ripple<OW0>(sess.ctx(), U, nw0, (uint64_t)G2, true); // U = gamma2 - w0
-      const auto r = sess.template adopt_authenticated_input<UR>(&rw.two_share[(size_t)RING_K * idx]);
-      for (int k = 0; k < RING_K; ++k)
-        R[k] = r[k];
-      window_producer<OW0, SPAN_W>(sess.ctx(), U, R, static_cast<Bit*>(nullptr), M);
-      for (int k = 0; k < RING_K; ++k)
-        M[k].pack_wires(&mww[(size_t)idx * RING_K + k]);
-    }
-  }
-  const BV<Ctx> B_v = BV<Ctx>::from_wires(sess.ctx(), bw.data());
-  const MZV<Ctx> Mz_v = MZV<Ctx>::from_wires(sess.ctx(), mzw.data());
-  const MWV<Ctx> Mw_v = MWV<Ctx>::from_wires(sess.ctx(), mww.data());
-  sess.checkpoint(); // run Phase 1 now; B / M become soldering sources
-  if (party == 1) // G1 split: prepsign (edaBits + A2B + Decompose) vs producers
+  // Phase 1 producers: one GMW circuit -> authenticated shares of (B, Mz, Mw).
+  emp::wrk::ShareVec<nP> pin;
+  pin.reserve(ps.y.two_share.size() + ps.w0_2.size() + rz.two_share.size() + rw.two_share.size());
+  pin.insert(pin.end(), ps.y.two_share.begin(), ps.y.two_share.end());
+  pin.insert(pin.end(), ps.w0_2.begin(), ps.w0_2.end());
+  pin.insert(pin.end(), rz.two_share.begin(), rz.two_share.end());
+  pin.insert(pin.end(), rw.two_share.begin(), rw.two_share.end());
+  emp::wrk::ShareVec<nP> bm = bk.gmw().evaluate(producer_program(), pin);
+  emp::expecting((int)bm.size() == BW + MZW + MWW, "Sign: producer output width");
+  if (party == 1)
     std::printf("G1SPLIT prepsign=%llu producers=%llu\n", (unsigned long long)(and_a1 - and_a0),
-                (unsigned long long)(sess.num_and() - and_a1));
+                (unsigned long long)(bk.gmw().ands_evaluated - and_a1));
 #ifdef TEST
-  timer_lap("ring edabits + phase 1");
+  timer_lap("ring edabits + producers");
 #endif
 
-  // Garble the fixed Phase 2 circuit before the message exists.
-  const uint64_t ands_before_prepare = sess.num_and();
-  auto prepared = sess.prepare(phase2_circuit());
+  // Garble C_post OFFLINE: rows, fixed-input labels and output masks all
+  // delivered to P1 before the message exists (wrk_phase2.h).
   if (g2_ands_out)
-    *g2_ands_out = (int64_t)(sess.num_and() - ands_before_prepare);
+    *g2_ands_out = (int64_t)emp::wrk::count_gc_ands(phase2_program());
+  WrkOffline<nP> off = wrk_offline<nP>(bk, phase2_program(), bm, (uint32_t)(BW + MZW + MWW));
 #ifdef TEST
-  timer_lap("prepare phase 2");
+  timer_lap("wrk offline garble");
 #endif
-  after_prepsign(); // offline/online boundary -- everything below needs msg
+  bk.gmw().finish(); // complete all malicious-COT checks; no GMW past this point
+  after_prepsign();  // offline/online boundary -- everything below needs msg
 
   // ---- online ----------------------------------------------------------------
   // 1b. mu = H(tr, m), c = H(mu, w1).
@@ -338,7 +376,7 @@ inline Signature sign(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& de
   std::array<uint32_t, 8> mu;
   h256_stub(mu_in, mu);
   std::vector<uint32_t> c_in(mu.begin(), mu.end());
-  c_in.insert(c_in.end(), w1.begin(), w1.end());
+  c_in.insert(c_in.end(), ps.w1.begin(), ps.w1.end());
   std::array<uint32_t, 8> c_seed;
   h256_stub(c_in, c_seed);
   sample_in_ball_stub(c_seed, sig.c);
@@ -348,9 +386,9 @@ inline Signature sign(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& de
     if (sig.c[j])
       c_nz.push_back({j, sig.c[j]});
 
-  // H^z = beta - c*s, H^w = beta + c*e on the ring shares (local, linear);
+  // Flight 1: H^z = beta - c*s, H^w = beta + c*e on the ring shares (local);
   // p^ = H^ - R^ over Z_{2^RING_W}, one checked BDOZ open for all positions.
-  std::vector<RingShare<nP>> ph((size_t)Y_COEFF_COUNT + COEFF_COUNT);
+  std::vector<RingShare<nP>> ph((size_t)M_TOTAL);
   {
     std::vector<RingShare<nP>> cs((size_t)Y_COEFF_COUNT), ce((size_t)COEFF_COUNT);
     for (int p = 0; p < ELL; ++p)
@@ -370,28 +408,26 @@ inline Signature sign(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& de
   if (party == 1)
     ph[0].val.w[0] ^= 1;
 #endif
-  const std::vector<RingVal> phat = open_ring_checked(sess.io(), party, dealer.my_alpha_r, ph);
+  const std::vector<RingVal> phat = open_ring_checked(bk.io(), party, dealer.my_alpha_r, ph);
 
-  // p = p^ mod 2^RING_K as public circuit inputs.
-  typename PV<Ctx>::clear_t pb{};
+  // Late public bits P = p^ mod 2^RING_K, z block then w block.
+  std::vector<uint8_t> late((size_t)PW);
   for (size_t i = 0; i < phat.size(); ++i)
     for (int k = 0; k < RING_K; ++k)
-      pb[i * RING_K + (size_t)k] = ((phat[i].w[0] >> k) & 1) != 0;
-  const PV<Ctx> P_v = sess.template input<PV<Ctx>>(emp::PUBLIC, pb);
+      late[i * RING_K + (size_t)k] = (uint8_t)((phat[i].w[0] >> k) & 1);
 
-  // One prepared run, one batched reveal.
-  const OUTV<Ctx> out = sess.run(std::move(prepared), B_v, Mz_v, Mw_v, P_v);
-  const auto opened = sess.reveal(out, 1); // Open((r, Z_out), P1): only the evaluator decodes
+  // Flight 2: garblers send selected labels; P1 evaluates and decodes locally.
+  auto res = wrk_online<nP>(bk, off, late);
   if (online_rounds_out)
-    *online_rounds_out = 3; // flight 1, run, reveal
+    *online_rounds_out = 2; // flight 1 (delta_H open), flight 2 (labels)
   if (party != 1)
     return sig;
-  emp::expecting(opened.has_value(), "Sign: online reveal failed");
+  emp::expecting(res.has_value(), "Sign: online evaluation failed");
 #ifdef TEST
-  timer_lap("open + run + reveal");
+  timer_lap("flight1 open + flight2 eval");
 #endif
 
-  const auto& ob = opened.value();
+  const std::vector<uint8_t>& ob = *res;
   const bool accept = ob[0];
 
 #ifdef TEST
@@ -517,7 +553,7 @@ inline Signature sign(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& de
   sample_in_ball_stub(v_seed, c_verify);
   int w1_diff = 0;
   for (int i = 0; i < COEFF_COUNT; ++i)
-    w1_diff += w1p[i] != w1[i];
+    w1_diff += w1p[i] != ps.w1[i];
   if (party == 1)
     std::printf("  Sign verify: w1 mismatches %d / %d, challenge %s\n", w1_diff, COEFF_COUNT,
                 c_verify == sig.c ? "MATCHES" : "DIFFERS");

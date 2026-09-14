@@ -14,9 +14,7 @@
 #define MLDSA_A2B_H
 
 #include "circuit.h" // fa, pack_bits/unpack_bits circuit primitives
-#include "edabits.h" // Fq_edabits, SharePair
-#include "spdz.h"      // FqShare, checked opens
-#include <emp-ag/emp-ag.h>
+#include "ref.h"     // L, Q
 
 #include <cstdint>
 #include <random>
@@ -67,38 +65,6 @@ inline UInt_T<Ctx, L> sub_modq(Ctx& ctx, const UInt_T<Ctx, L>& c, // public
   }
   // final carry dropped => w = (c - r) mod Q, in [0, Q).
   return pack_bits<L>(ctx, w);
-}
-
-template <int nP>
-inline std::vector<emp::UInt_T<typename emp::AGMPCSession<nP>::ctx_t, L>>
-a2b(emp::AGMPCSession<nP>& sess, int party, FakeDealer<nP>& dealer,
-    const std::vector<FqShare<nP>>& x_share) {
-  using Ctx = typename emp::AGMPCSession<nP>::ctx_t;
-  using U23 = emp::UInt_T<Ctx, L>;
-  const int count = (int)x_share.size();
-
-  // 1. one edaBit mask per coefficient.
-  SharePair<nP, L, true> r = Fq_edabits<nP, L>(sess, party, dealer, count);
-
-  // 2. open c = x + r with an SPDZ MACCheck.
-  std::vector<FqShare<nP>> c_share((size_t)count);
-  for (int i = 0; i < count; ++i)
-    c_share[(size_t)i] = x_share[(size_t)i] + r.fq_share[(size_t)i];
-#ifdef TAMPER_C
-  if (party == 1 && count > 0)
-    c_share[0].val ^= 1;
-#endif
-  const std::vector<uint32_t> c = open_fq_checked(sess.io(), party, dealer.my_alpha_f, c_share);
-
-  // 3. x = c - r mod q inside the circuit.
-  std::vector<U23> out;
-  out.reserve((size_t)count);
-  for (int i = 0; i < count; ++i) {
-    U23 rr = sess.template adopt_authenticated_input<U23>(&r.two_share[(size_t)L * i]);
-    U23 c_public = sess.template input<U23>(emp::PUBLIC, (uint64_t)c[i]);
-    out.push_back(sub_modq(sess.ctx(), c_public, rr));
-  }
-  return out;
 }
 
 } // namespace mldsa
