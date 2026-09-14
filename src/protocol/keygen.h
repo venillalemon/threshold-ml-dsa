@@ -58,26 +58,30 @@ inline KeyPair<nP> keygen(Backend<nP>& bk, int party, FakeDealer<nP>& dealer) {
   kp.rho = fcoin_rho();
   expand_a(kp.rho, kp.A);
 
-  // <s>: ell polynomials, <e>: k polynomials, both eta-small (F_smallnormpoly).
-  kp.s = rand_edabits<nP, ETA, Y_COEFF_COUNT>(bk, party, dealer);
+  // <s>, <e>: eta-small. The dealer samples them (plaintext known to it) and
+  // deals the shares Sign needs; only the ring shares are consumed online.
+  auto S = dealer.deal_secret_poly(Y_COEFF_COUNT, ETA);
+  auto E = dealer.deal_secret_poly(COEFF_COUNT, ETA);
+  kp.s.fq_share = S.fq;
+  kp.s.ring_share = S.ring;
+  kp.e.fq_share = E.fq;
+  kp.e.ring_share = E.ring;
 #ifdef TEST
-  timer_lap("s smallnormpoly");
-#endif
-  kp.e = rand_edabits<nP, ETA, COEFF_COUNT>(bk, party, dealer);
-#ifdef TEST
-  timer_lap("e smallnormpoly");
-#endif
-
-  // 2. <t>_q = A<s>_q + <e>_q, then Fopen(<t>_q) gated by a MACCheck.
-  std::vector<FqShare<nP>> t_share = kp.e.fq_share;
-  matvec_negacyclic(kp.A, kp.s.fq_share, t_share, K, ELL);
-#ifdef TEST
-  timer_lap("A*s + e (local)");
+  timer_lap("s, e (dealer)");
 #endif
 
-  kp.t = open_fq_checked(bk.io(), party, dealer.my_alpha_f, t_share);
+  // 2. t = A*s + e computed IN PLAINTEXT (the dealer knows s, e). No share
+  //    matrix-multiply, no opening -- KeyGen touches the network zero times.
+  std::vector<uint32_t> s_modq((size_t)Y_COEFF_COUNT), e_modq((size_t)COEFF_COUNT);
+  for (int i = 0; i < Y_COEFF_COUNT; ++i)
+    s_modq[(size_t)i] = (uint32_t)((S.plain[(size_t)i] % Q + Q) % Q);
+  for (int i = 0; i < COEFF_COUNT; ++i)
+    e_modq[(size_t)i] = (uint32_t)((E.plain[(size_t)i] % Q + Q) % Q);
+  kp.t = matvec_pub_negacyclic(kp.A, s_modq, K, ELL);
+  for (int i = 0; i < COEFF_COUNT; ++i)
+    kp.t[(size_t)i] = fq_add(kp.t[(size_t)i], e_modq[(size_t)i]);
 #ifdef TEST
-  timer_lap("open t + MACCheck");
+  timer_lap("t = A*s + e (plaintext)");
 #endif
 
   // 3. Power2Round and tr; both local on the now-public t.

@@ -75,7 +75,7 @@ threshold-ml-dsa/
 | 文件 | 对应论文 | 内容 |
 |---|---|---|
 | `rand.h` | Π_smallnormpoly | dealer 直接采 [-η,η] 小范数份额(算术,无拒绝采样) |
-| `keygen.h` | Π_MLDSA.KeyGen | s/e 采样、开 t + MACCheck、Power2Round,产出 pk 与 `KeyPair` |
+| `keygen.h` | Π_MLDSA.KeyGen | dealer 采 s/e 并发环份额,**明文**算 t = A·s+e,Power2Round,产出 pk 与 `KeyPair`(零网络) |
 | `prepsign.h` | Π_PrepSign | 离线预处理:采 y/e_w、w = Ay+e_w、A2B、Decompose,返回 (⟨w₀⟩₂, w₁, ⟨y⟩₂) |
 | `sign.h` | Π_MLDSA.Sign | 在线签名(T=1):挑战 c、r₀/z 拒绝电路(只公开判定位)、开 z、MakeHint |
 

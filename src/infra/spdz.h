@@ -582,6 +582,29 @@ template <int nP> struct FakeDealer {
     return out;
   }
 
+  // A small-norm secret polynomial for KeyGen: sample each coefficient uniformly
+  // in [-eta, eta] and deal its F_q and ring shares. Since the dealer knows the
+  // plaintext (it sampled it), it also returns `plain` so KeyGen can compute the
+  // public t = A*s + e directly, with no share matrix-multiply and no opening.
+  struct SecretPoly {
+    std::vector<int32_t> plain;         // centered coefficients in [-eta, eta]
+    std::vector<FqShare<nP>> fq;
+    std::vector<RingShare<nP>> ring;
+  };
+  SecretPoly deal_secret_poly(int count, int eta) {
+    SecretPoly out;
+    out.plain.resize((size_t)count);
+    out.fq.resize((size_t)count);
+    out.ring.resize((size_t)count);
+    for (int i = 0; i < count; ++i) {
+      const int32_t v = (int32_t)draw_uniform(2 * (uint64_t)eta + 1) - eta;
+      out.plain[(size_t)i] = v;
+      out.fq[(size_t)i] = deal_fq((uint32_t)(((v % Q) + Q) % Q));
+      out.ring[(size_t)i] = deal_ring(ring_from_i64(v));
+    }
+    return out;
+  }
+
   // Uniform element of Z_{2^RING_W} from the shared stream (same at every party).
   RingVal ring_rand() {
     RingVal r;
