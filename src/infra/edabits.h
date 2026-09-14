@@ -1,17 +1,21 @@
-// src/infra/edabits.h — demo edaBits for the PrepSign prototype.
+// src/infra/edabits.h — demo edaBits for the mixed-security PrepSign.
 //
-// Returns authenticated arithmetic and Boolean representations. The unsigned
-// and signed edaBit APIs represent the same value in both domains; y_edabits
-// uses the documented affine encoding two_share=y-1, q_share=y.
+// Returns authenticated arithmetic and Boolean representations. The Boolean
+// half is now an authenticated GMW/WRK share (emp::wrk::AuthShare) under the
+// backend's single Delta, so it can be fed directly into an offline GMW circuit
+// (C_pre) or installed as a fixed input of the WRK circuit (C_post). The
+// arithmetic half is the FakeDealer BDOZ share, unchanged.
 //
-// This is deliberately the same CHEAT that used to live in main.cpp: draw the
-// Boolean shares, XOR-open r, then dealer-split that public r in F_Q. A real
-// implementation must produce both representations without opening r.
+// This is deliberately the same CHEAT as before: draw the Boolean shares from
+// GMW, XOR-open r, then dealer-split that public r in F_Q / the ring. A real
+// implementation must produce both representations without opening r (e.g. a
+// real edaBit protocol). Only the Boolean-share PROVENANCE changed (KRRW aBit
+// pool -> authenticated GMW), not the cheat.
 #ifndef MLDSA_EDABITS_H
 #define MLDSA_EDABITS_H
 
+#include "backend.h"
 #include "spdz.h"
-#include <emp-ag/emp-ag.h>
 
 #include <algorithm>
 #include <cmath>
@@ -33,18 +37,21 @@ template <int nP, int BitWidth, bool IsUnsigned> struct SharePair {
 
   std::vector<FqShare<nP>> fq_share;     // pairwise-authenticated F_q share
   std::vector<RingShare<nP>> ring_share; // same value in Z_{2^RING_W} (two's complement if signed)
-  emp::ag::AShareBundleVec<nP> two_share;
+  emp::wrk::AuthShareVec<nP> two_share;  // GMW/WRK authenticated Boolean bits, LSB first
 };
 
 // Ring eDaBit (paper: eDaBit_{2^k,k}): a uniform widened R^ in Z_{2^RING_W}
-// as a ring share, and the low KB bits of R^ as Boolean shares.
+// as a ring share, and the low KB bits of R^ as authenticated GMW Boolean bits.
 template <int nP> struct RingEdabits {
   std::vector<RingShare<nP>> ring_share;
-  emp::ag::AShareBundleVec<nP> two_share; // KB bits per value, little-endian
+  emp::wrk::AuthShareVec<nP> two_share; // KB bits per value, little-endian
 };
 
+// The local XOR-share bit of an authenticated GMW/WRK Boolean share.
+template <int nP> inline uint8_t local_bit(const emp::wrk::AuthShare<nP>& s) { return s.bit & 1; }
+
 template <int nP, int BitWidth, bool IsUnsigned>
-inline SharePair<nP, BitWidth, IsUnsigned> edabits(emp::AGMPCSession<nP>& sess, int party,
+inline SharePair<nP, BitWidth, IsUnsigned> edabits(Backend<nP>& bk, int party,
                                                    FakeDealer<nP>& dealer, int count) {
   static_assert(BitWidth > 0 && BitWidth < 32, "edabits: BitWidth must be in [1,31]");
   emp::expecting(count >= 0, "edabits: count must be non-negative");
@@ -52,21 +59,19 @@ inline SharePair<nP, BitWidth, IsUnsigned> edabits(emp::AGMPCSession<nP>& sess, 
   SharePair<nP, BitWidth, IsUnsigned> out;
   if (count == 0)
     return out;
-  sess.protocol().fpre->abit.draw(BitWidth * count, out.two_share);
+  out.two_share = bk.gmw().random((size_t)BitWidth * count);
 
-  // Pack this party's local XOR-bit shares for each coefficient. The local
-  // share bit is encoded in bit 0 of every peer MAC, so slot 0 is sufficient.
+  // Pack this party's local XOR-bit shares for each coefficient.
   std::vector<uint32_t> xor_r_share((size_t)count);
   for (int i = 0; i < count; ++i) {
     uint32_t v = 0;
     for (int k = 0; k < BitWidth; ++k)
-      v |= (uint32_t)emp::getLSB(out.two_share[BitWidth * i + k].mac(0)) << k;
+      v |= (uint32_t)local_bit<nP>(out.two_share[BitWidth * i + k]) << k;
     xor_r_share[i] = v;
   }
 
   // DEMO CHEAT: reveal r only to manufacture a matching arithmetic share.
-  // The returned object does not expose this public intermediate.
-  const std::vector<uint32_t> r = open_xor(sess.io(), party, xor_r_share);
+  const std::vector<uint32_t> r = open_xor(bk.io(), party, xor_r_share);
   out.fq_share.resize((size_t)count);
   out.ring_share.resize((size_t)count);
   constexpr uint64_t VALUE_RANGE = uint64_t{1} << BitWidth;
@@ -87,27 +92,26 @@ inline SharePair<nP, BitWidth, IsUnsigned> edabits(emp::AGMPCSession<nP>& sess, 
   return out;
 }
 
-// Ring eDaBits: draw RING_K Boolean bits per value, XOR-open them (same DEMO
-// cheat as above), and let the dealer split a widened R^ whose low RING_K
-// bits equal the opened R and whose high bits come from the shared stream.
+// Ring eDaBits: draw RING_K Boolean bits per value from GMW, XOR-open them (same
+// DEMO cheat), and let the dealer split a widened R^ whose low RING_K bits equal
+// the opened R and whose high bits come from the shared stream.
 template <int nP, int KB>
-inline RingEdabits<nP> ring_edabits(emp::AGMPCSession<nP>& sess, int party,
-                                    FakeDealer<nP>& dealer, int count) {
+inline RingEdabits<nP> ring_edabits(Backend<nP>& bk, int party, FakeDealer<nP>& dealer, int count) {
   static_assert(KB > 0 && KB < 32, "ring_edabits: KB must be in [1,31]");
   emp::expecting(count >= 0, "ring_edabits: count must be non-negative");
   RingEdabits<nP> out;
   if (count == 0)
     return out;
   constexpr uint64_t KMASK = (uint64_t{1} << KB) - 1;
-  sess.protocol().fpre->abit.draw(KB * count, out.two_share);
+  out.two_share = bk.gmw().random((size_t)KB * count);
   std::vector<uint32_t> xor_r_share((size_t)count);
   for (int i = 0; i < count; ++i) {
     uint32_t v = 0;
     for (int k = 0; k < KB; ++k)
-      v |= (uint32_t)emp::getLSB(out.two_share[(size_t)KB * i + k].mac(0)) << k;
+      v |= (uint32_t)local_bit<nP>(out.two_share[(size_t)KB * i + k]) << k;
     xor_r_share[(size_t)i] = v;
   }
-  const std::vector<uint32_t> r = open_xor(sess.io(), party, xor_r_share);
+  const std::vector<uint32_t> r = open_xor(bk.io(), party, xor_r_share);
   out.ring_share.resize((size_t)count);
   for (int i = 0; i < count; ++i) {
     RingVal v = dealer.ring_rand(); // uniform widened lift R^
@@ -119,28 +123,25 @@ inline RingEdabits<nP> ring_edabits(emp::AGMPCSession<nP>& sess, int party,
 
 // Unsigned edaBits over [0, 2^BitWidth).
 template <int nP, int BitWidth>
-inline SharePair<nP, BitWidth, true> unsigned_edabits(emp::AGMPCSession<nP>& sess, int party,
+inline SharePair<nP, BitWidth, true> unsigned_edabits(Backend<nP>& bk, int party,
                                                       FakeDealer<nP>& dealer, int count) {
-  return edabits<nP, BitWidth, true>(sess, party, dealer, count);
+  return edabits<nP, BitWidth, true>(bk, party, dealer, count);
 }
 
 // Signed edaBits over [-2^(BitWidth-1), 2^(BitWidth-1)-1].
 template <int nP, int BitWidth>
-inline SharePair<nP, BitWidth, false> signed_edabits(emp::AGMPCSession<nP>& sess, int party,
+inline SharePair<nP, BitWidth, false> signed_edabits(Backend<nP>& bk, int party,
                                                      FakeDealer<nP>& dealer, int count) {
-  return edabits<nP, BitWidth, false>(sess, party, dealer, count);
+  return edabits<nP, BitWidth, false>(bk, party, dealer, count);
 }
 
-// If signed_edabits returns s in
-// [-2^(BitWidth-1), 2^(BitWidth-1)-1], then y=s+1 lies in
-// (-2^(BitWidth-1), 2^(BitWidth-1)]. The Boolean output deliberately remains
-// the two's-complement sharing of s=y-1; the arithmetic output is a sharing of
-// y itself. A later Boolean circuit can therefore compute with y as s+1 while
-// retaining the exact left-open/right-closed ML-DSA sampling interval.
+// If signed_edabits returns s in [-2^(BitWidth-1), 2^(BitWidth-1)-1], then
+// y=s+1 lies in (-2^(BitWidth-1), 2^(BitWidth-1)]. The Boolean output stays the
+// two's-complement sharing of s=y-1; the arithmetic output is a sharing of y.
 template <int nP, int BitWidth>
-inline SharePair<nP, BitWidth, false> y_edabits(emp::AGMPCSession<nP>& sess, int party,
+inline SharePair<nP, BitWidth, false> y_edabits(Backend<nP>& bk, int party,
                                                 FakeDealer<nP>& dealer, int count) {
-  SharePair<nP, BitWidth, false> out = signed_edabits<nP, BitWidth>(sess, party, dealer, count);
+  SharePair<nP, BitWidth, false> out = signed_edabits<nP, BitWidth>(bk, party, dealer, count);
   // y = s + 1: add a public constant the SPDZ way — one party adds it to the
   // value share, EVERY party adds alpha_p*1 to its MAC share (no full alpha).
   for (FqShare<nP>& fs : out.fq_share)
@@ -151,11 +152,10 @@ inline SharePair<nP, BitWidth, false> y_edabits(emp::AGMPCSession<nP>& sess, int
 }
 
 // edaBits of a uniform element of F_q: draw unsigned BitWidth-bit edaBits and
-// reject those >= Q (oversampled so the batch suffices except with probability
-// 2^-lambda).
+// reject those >= Q (oversampled so the batch suffices except w.p. 2^-lambda).
 template <int nP, int BitWidth>
-inline SharePair<nP, BitWidth, true> Fq_edabits(emp::AGMPCSession<nP>& sess, int party,
-                                                FakeDealer<nP>& dealer, int count) {
+inline SharePair<nP, BitWidth, true> Fq_edabits(Backend<nP>& bk, int party, FakeDealer<nP>& dealer,
+                                                int count) {
   static_assert(BitWidth > 0 && BitWidth < 32, "Fq_edabits: BitWidth must be in [1,31]");
   emp::expecting(count >= 0, "Fq_edabits: count must be non-negative");
   if (count == 0)
@@ -163,21 +163,20 @@ inline SharePair<nP, BitWidth, true> Fq_edabits(emp::AGMPCSession<nP>& sess, int
 
   constexpr uint64_t VALUE_RANGE = uint64_t{1} << BitWidth;
   if constexpr (VALUE_RANGE <= (uint64_t)Q)
-    return unsigned_edabits<nP, BitWidth>(sess, party, dealer, count);
+    return unsigned_edabits<nP, BitWidth>(bk, party, dealer, count);
 
   const int sample_count = (int)std::ceil(
       (double)count * VALUE_RANGE * (1.0 + std::sqrt(2 * lambda * std::log(2.0) / count)) / Q);
-  SharePair<nP, BitWidth, true> out =
-      unsigned_edabits<nP, BitWidth>(sess, party, dealer, sample_count);
+  SharePair<nP, BitWidth, true> out = unsigned_edabits<nP, BitWidth>(bk, party, dealer, sample_count);
 
   std::vector<uint32_t> xor_r_share((size_t)sample_count);
   for (int i = 0; i < sample_count; ++i) {
     uint32_t v = 0;
     for (int k = 0; k < BitWidth; ++k)
-      v |= (uint32_t)emp::getLSB(out.two_share[BitWidth * i + k].mac(0)) << k;
+      v |= (uint32_t)local_bit<nP>(out.two_share[BitWidth * i + k]) << k;
     xor_r_share[i] = v;
   }
-  const std::vector<uint32_t> r = open_xor(sess.io(), party, xor_r_share);
+  const std::vector<uint32_t> r = open_xor(bk.io(), party, xor_r_share);
   std::vector<int> valid_index((size_t)sample_count);
   std::iota(valid_index.begin(), valid_index.end(), 0);
   valid_index.erase(std::remove_if(valid_index.begin(), valid_index.end(),
