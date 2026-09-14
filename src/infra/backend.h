@@ -12,27 +12,40 @@
 // One NetIOMP<nP> is shared by three consumers, used strictly sequentially:
 //   * the GMW engine (its own TriplePool owns the COT setup);
 //   * the WRK offline delivery (rows + fixed labels + output masks to P1);
-//   * the arithmetic BDOZ opens of spdz.h (open_fq_checked / open_ring_* ).
+//   * the arithmetic BDOZ opens of bdoz.h (open_fq_checked / open_ring_* ).
 // The arithmetic layer (FakeDealer) keeps its own slopes; the boolean layer
 // lives entirely in emp::wrk::AuthShare under this session's single GMW Delta.
 #ifndef MLDSA_BACKEND_H
 #define MLDSA_BACKEND_H
 
-#include "spdz.h" // mldsa::deterministic_delta (shared with FakeDealer)
-
 #include <emp-ag/gmw.h>
 #include <emp-ag/wrk.h>
 #include <emp-ag/backend/netmp.h>
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <optional>
 
 namespace mldsa {
 
-// The backend's Delta is the SAME deterministic per-party key the FakeDealer
-// reconstructs (spdz.h), so dealer-fabricated Boolean edaBit shares authenticate
-// under it. Demo cheat: a real deployment keeps Delta private.
+// Per-party Boolean authentication key with the aShare pinned-bit profile the
+// vendored AuthSharePool enforces (bit0 = 1, bit1 = party==1 ? nP%2 : 1). The
+// DEFAULT is a private key sampled from this party's own PRG — the real
+// behaviour. The demo main instead passes the FakeDealer's deterministic Delta
+// (dealer.h) so dealer-fabricated Boolean edaBit shares authenticate under it.
+template <int nP> inline emp::block private_pinned_delta(int party) {
+  emp::block d;
+  emp::PRG prg;
+  prg.random_block(&d, 1);
+  std::array<uint8_t, 16> raw{};
+  std::memcpy(raw.data(), &d, 16);
+  const uint8_t bit1 = (party == 1) ? (uint8_t)(nP % 2) : (uint8_t)1;
+  raw[0] = (uint8_t)((raw[0] & ~3U) | 1U | (bit1 << 1));
+  std::memcpy(&d, raw.data(), 16);
+  return d;
+}
 
 // A fixed, party-independent session id. Every party derives the identical
 // block with no communication. This is a demo stand-in for a fresh unpredictable
@@ -50,9 +63,12 @@ public:
   using Share = emp::wrk::AuthShare<nP>;
   using Shares = emp::wrk::ShareVec<nP>;
 
-  Backend(int party, int port, ThreadPool* pool, int triple_ssp = 80)
+  // `delta` defaults to a private random key; pass the dealer's Delta for the
+  // demo's dealer-fabricated Boolean correlations.
+  Backend(int party, int port, ThreadPool* pool,
+          std::optional<emp::block> delta = std::nullopt, int triple_ssp = 80)
       : party_(party), pool_(pool), io_(party, port),
-        delta_(deterministic_delta<nP>(party)), sid_(demo_session_id()),
+        delta_(delta ? *delta : private_pinned_delta<nP>(party)), sid_(demo_session_id()),
         gmw_(&io_, pool, party, sid_, delta_, triple_ssp) {}
 
   Backend(const Backend&) = delete;

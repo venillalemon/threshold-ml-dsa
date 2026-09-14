@@ -11,10 +11,8 @@
 
 #include "a2b.h"        // sub_modq kernel
 #include "decompose.h"  // decompose<PARAM>, OW0, OW1
-#include "edabits.h"
+#include "dealer.h"
 #include "phase1_util.h"
-#include "rand.h"
-#include "spdz.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -76,8 +74,8 @@ inline PrepSignOut<nP> prepsign(Backend<nP>& bk, int party, FakeDealer<nP>& deal
   PrepSignOut<nP> out;
 
   // <y>_2,<y>_q and <e_w>_q. <e_w>_2 is intentionally unused.
-  out.y = y_edabits<nP, Y_WIDTH>(bk, party, dealer, Y_COEFF_COUNT);
-  SharePair<nP, (ETA == 2 ? 3 : 4), false> ew = rand_edabits<nP, ETA, COEFF_COUNT>(bk, party, dealer);
+  out.y = dealer.template deal_y_edabit<Y_WIDTH>(Y_COEFF_COUNT);
+  auto ew = dealer.deal_secret_poly(COEFF_COUNT, ETA); // e_w: arithmetic only
 
 #ifdef TEST
   auto open_q = [&](const std::vector<FqShare<nP>>& s) {
@@ -85,7 +83,7 @@ inline PrepSignOut<nP> prepsign(Backend<nP>& bk, int party, FakeDealer<nP>& deal
   };
   auto centered = [](uint32_t x) { return x > (uint32_t)Q / 2 ? (int32_t)x - Q : (int32_t)x; };
   const std::vector<uint32_t> opened_y = open_q(out.y.fq_share);
-  const std::vector<uint32_t> opened_ew = open_q(ew.fq_share);
+  const std::vector<uint32_t> opened_ew = open_q(ew.fq);
   int y_bad = 0, ew_bad = 0;
   for (uint32_t x : opened_y)
     y_bad += centered(x) <= -GAMMA1 || centered(x) > GAMMA1;
@@ -96,11 +94,11 @@ inline PrepSignOut<nP> prepsign(Backend<nP>& bk, int party, FakeDealer<nP>& deal
 #endif
 
   // <w>_q = A<y>_q + <e_w>_q.
-  std::vector<FqShare<nP>> w_share = ew.fq_share;
+  std::vector<FqShare<nP>> w_share = ew.fq;
   matvec_negacyclic(A, out.y.fq_share, w_share, K, ELL);
 
   // A2B mask R2, and the checked field open c = w + R2.
-  SharePair<nP, L, true> r2 = Fq_edabits<nP, L>(bk, party, dealer, COEFF_COUNT);
+  SharePair<nP, L, true> r2 = dealer.template deal_fq_edabit<L>(COEFF_COUNT);
   std::vector<FqShare<nP>> c_share((size_t)COEFF_COUNT);
   for (int i = 0; i < COEFF_COUNT; ++i)
     c_share[(size_t)i] = w_share[(size_t)i] + r2.fq_share[(size_t)i];

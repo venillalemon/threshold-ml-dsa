@@ -35,12 +35,11 @@
 
 #include "backend.h"
 #include "circuit.h"
-#include "edabits.h"
+#include "dealer.h"
 #include "keygen.h"
 #include "phase1_util.h"
 #include "prepsign.h"
 #include "ref.h"
-#include "spdz.h"
 #include "wrk_phase2.h"
 #include <emp-tool/circuits/frontend/frontend.h>
 #include <emp-tool/ir/context/record.h>
@@ -339,8 +338,8 @@ inline Signature sign(Backend<nP>& bk, int party, FakeDealer<nP>& dealer, KeyPai
 #endif
 
   // Ring eDaBits (R^, r) for every response and low-bit position.
-  RingEdabits<nP> rz = ring_edabits<nP, RING_K>(bk, party, dealer, Y_COEFF_COUNT);
-  RingEdabits<nP> rw = ring_edabits<nP, RING_K>(bk, party, dealer, COEFF_COUNT);
+  RingEdabits<nP> rz = dealer.template deal_ring_edabit<RING_K>(Y_COEFF_COUNT);
+  RingEdabits<nP> rw = dealer.template deal_ring_edabit<RING_K>(COEFF_COUNT);
 
   // Phase 1 producers: one GMW circuit -> authenticated shares of (B, Mz, Mw).
   emp::wrk::ShareVec<nP> pin;

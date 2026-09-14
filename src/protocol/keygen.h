@@ -1,7 +1,7 @@
 // src/protocol/keygen.h — Pi_MLDSA KeyGen.
 //
 // Paper steps -> code:
-//   1. rho <- Fcoin; <s>,<e> <- F_smallnormpoly   fcoin_rho (CHEAT), rand_edabits
+//   1. rho <- Fcoin; <s>,<e> <- F_smallnormpoly   fcoin_rho (CHEAT), dealer.deal_secret_poly
 //   2. A = ExpandA(rho); <t>_q = A<s>_q + <e>_q   expand_a (CHEAT), matvec_negacyclic
 //      Fopen(<t>_q)                               open_fq_checked (pairwise BDOZ)
 //   3. (t1,t0) = Power2Round(t,d); tr = H(rho,t1) ref_power2round, h256_stub (CHEAT)
@@ -12,9 +12,8 @@
 #ifndef MLDSA_KEYGEN_H
 #define MLDSA_KEYGEN_H
 
-#include "rand.h"
+#include "dealer.h"
 #include "ref.h"
-#include "spdz.h"
 #include "backend.h"
 
 #include <array>

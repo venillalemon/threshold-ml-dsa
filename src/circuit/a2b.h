@@ -1,7 +1,7 @@
 // src/circuit/a2b.h — F_A2B: convert an authenticated arithmetic sharing <x>_q into
 // Boolean circuit values <x>_2 inside the AG session, by mask-and-open:
 //
-//   1. draw edaBit masks (<r>_q, <r>_2) with r uniform in [0,Q)   (Fq_edabits)
+//   1. draw edaBit masks (<r>_q, <r>_2) with r uniform in [0,Q)   (dealer.deal_fq_edabit)
 //   2. open c = x + r mod q publicly, checked pairwise (BDOZ) in one flight
 //   3. inside the circuit compute x = c - r mod q                 (sub_modq)
 //

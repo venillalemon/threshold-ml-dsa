@@ -26,20 +26,21 @@ int main(int argc, char** argv) {
   const int party = parse_party(argv, nP);
   ThreadPool pool(ag::default_pool_size(nP));
 
-  const auto setup_start = clock_start();
-  Backend<nP> bk(party, peer_port(), &pool);
-  const double setup_ms = time_from(setup_start) / 1000.0;
-  const int64_t setup_comm = bk.comm_bytes();
-
-  // Demo-only offline from a common seed (spdz.h FakeDealer): every party's
-  // BDOZ slope lives only inside the dealer; protocols see their own slope.
-  // Seed from the shared port so all parties agree yet each run differs (the
-  // dealer now supplies every correlation, so a fixed seed would make every
-  // attempt identical). Override with EMP_SEED to reproduce a specific run.
+  // Demo-only offline (dealer.h FakeDealer): every correlation and every
+  // authentication key is dealt from a common seed; protocols only ever see
+  // their own slot. Seed from the shared port so all parties agree yet each
+  // run differs; EMP_SEED reproduces a specific run.
   const char* seed_env = std::getenv("EMP_SEED");
   const uint32_t seed = seed_env ? (uint32_t)std::strtoul(seed_env, nullptr, 10)
                                  : (0x9e3779b9u ^ (uint32_t)peer_port());
   FakeDealer<nP> dealer(party, seed);
+
+  // The backend takes the dealer's Delta so dealer-fabricated Boolean shares
+  // authenticate under it (drop the argument for a private random key).
+  const auto setup_start = clock_start();
+  Backend<nP> bk(party, peer_port(), &pool, dealer.my_delta);
+  const double setup_ms = time_from(setup_start) / 1000.0;
+  const int64_t setup_comm = bk.comm_bytes();
 
   const auto keygen_start = clock_start();
   KeyPair<nP> kp = keygen<nP>(bk, party, dealer);

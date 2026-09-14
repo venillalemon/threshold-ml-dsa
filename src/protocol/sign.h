@@ -30,11 +30,10 @@
 #define MLDSA_SIGN_H
 
 #include "circuit.h"
-#include "edabits.h"
+#include "dealer.h"
 #include "keygen.h"
 #include "prepsign.h"
 #include "ref.h"
-#include "spdz.h"
 #include <emp-ag/emp-ag.h>
 #include <emp-tool/circuits/frontend/frontend.h>
 
