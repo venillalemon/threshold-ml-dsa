@@ -30,9 +30,8 @@ ML-DSA 签名**(验证方无需知道签名是 MPC 产的)。
 |---|---|---|
 | `src/infra/backend.h` | `Backend<nP>` | 一个 `NetIOMP` 同时供 GMW(离线电路)、WRK(在线电路)与算术 BDOZ 开启;每方私有 pinned Δ |
 | `src/circuit/wrk_phase2.h` | `wrk_offline` / `wrk_online` | C_post 离线混淆 + 离线开输出掩码;在线一次标签投递后本地解码 |
-| `src/protocol/prepsign.h` | `recover_decompose_program` | A2B + Decompose 编译成一张 GMW 电路 |
-| `src/protocol/sign_2round.h` | `producer_program` | 两轮:边界 producer 一张 GMW 电路;C_post 的 late 输入是**公开的** δ_H(`wrk_online`) |
-| `src/protocol/sign_slot.h` | `slot_producer_program` | slot:producer + one-hot 解码 + 压缩网络 + 空槽 MUX 一张 GMW 电路;C_post 的 late 输入 d^ 由 P1 **free-XOR** u 的标签得到(`wrk_online_routed`) |
+| `src/protocol/sign_2round.h` | `cpre_program` | 两轮:**一张** GMW 电路 C_pre(恢复 w、Decompose、producer);C_post 的 late 输入是**公开的** δ_H(`wrk_online`) |
+| `src/protocol/sign_slot.h` | `cpre_program` | slot:**一张** GMW 电路 C_pre(恢复 w、Decompose、producer、one-hot 解码、压缩网络、空槽 MUX、ovf);C_post 的 late 输入 d^ 由 P1 **free-XOR** u 的标签得到(`wrk_online_routed`) |
 | `third_party/emp-ag/` | `emp::gmw` / `emp::wrk` | vendored WRK 四行 + 认证 GMW 后端(依赖 emp-tool / emp-ot) |
 
 **状态**:两种模式都在新后端上跑通并验证(2/3 方 ML-DSA-44):KeyGen/Decompose
@@ -82,9 +81,8 @@ threshold-ml-dsa/
 | 文件 | 对应论文 | 内容 |
 |---|---|---|
 | `keygen.h` | Π_MLDSA.KeyGen | dealer 采 s/e 并发环份额,**明文**算 t = A·s+e,Power2Round,产出 pk 与 `KeyPair`(零网络) |
-| `prepsign.h` | Π_PrepSign | 离线预处理:采 y/e_w、w = Ay+e_w、A2B、Decompose,返回 (⟨w₀⟩₂, w₁, ⟨y⟩₂) |
-| `sign_2round.h` | Π_TwoRound(main.pdf) | 两轮签名:producer(GMW)→ C_post(WRK,δ_H 公开 late 输入)→ 挑战、flight 1 开 δ_H、flight 2 投标签、本地解码、MakeHint |
-| `sign_slot.h` | Π_Slot(slot pdf Fig. 1) | slot 签名:producer+解码+压缩(GMW)→ C_post(WRK,u 固定输入、d^ 由 free-XOR 路由)→ 同上,flight 2 携带 576 个缓冲门的表 |
+| `sign_2round.h` | Π_TwoRound(main.pdf) | 步骤 1 eDaBits(dealer)→ 步骤 2 w = Ay+e_w、开 c(BDOZ)→ 步骤 3 一张 C_pre(GMW)→ C_post 离线混淆(WRK,δ_H 公开 late 输入)→ 挑战、flight 1 开 δ_H、flight 2 投标签、本地解码、MakeHint |
+| `sign_slot.h` | Π_Slot(slot pdf Fig. 1) | 同上结构;C_pre 多了解码/压缩/MUX,开 (w1, ovf);C_post 固定输入 M̂、ρ、u,d^ 由 free-XOR 路由,flight 2 携带 N_s·ν 个缓冲门的表 |
 
 分层依赖自下而上:`infra → circuit → protocol → main.cpp`。
 
