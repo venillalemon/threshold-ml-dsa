@@ -217,21 +217,23 @@ template <int nP> struct FakeDealer {
   // communication and zero GMW; the real circuits (C_ad, C_prod, C_post) are the
   // only MPC that runs.
 
-  // y uniform in (-2^(W-1), 2^(W-1)] (ML-DSA's left-open interval). Boolean half
-  // is the two's-complement W-bit encoding of v = y - 1; arithmetic halves are y.
-  template <int BitWidth> SharePair<nP, BitWidth, false> deal_y_edabit(int count) {
+  // Paper step 1, eDaBit(q, a, n_z): R_y uniform in [0, 2^W) with W = a =
+  // log2(2*gamma1). The Boolean half is bin_W(R_y) exactly as in the paper; the
+  // arithmetic halves carry y = gamma1 - R_y (paper step 2), which lands in
+  // ML-DSA's left-open interval (-gamma1, gamma1]. The producer circuit then
+  // consumes R_y = U^z directly, no re-encoding.
+  template <int BitWidth> SharePair<nP, BitWidth, true> deal_y_edabit(int count) {
     static_assert(BitWidth > 0 && BitWidth < 32, "deal_y_edabit: BitWidth in [1,31]");
-    SharePair<nP, BitWidth, false> out;
+    SharePair<nP, BitWidth, true> out;
     out.fq_share.resize((size_t)count);
     out.ring_share.resize((size_t)count);
     out.two_share.resize((size_t)BitWidth * count);
     for (int i = 0; i < count; ++i) {
-      const uint64_t vu = draw_uniform(uint64_t{1} << BitWidth); // v = s (two's complement)
-      const int64_t s = (vu >> (BitWidth - 1)) ? (int64_t)vu - (int64_t{1} << BitWidth) : (int64_t)vu;
-      const int64_t y = s + 1;
+      const uint64_t ry = draw_uniform(uint64_t{1} << BitWidth);      // R_y in [0, 2^W)
+      const int64_t y = (int64_t{1} << (BitWidth - 1)) - (int64_t)ry;  // y = gamma1 - R_y
       out.fq_share[(size_t)i] = deal_fq((uint32_t)(((y % Q) + Q) % Q));
       out.ring_share[(size_t)i] = deal_ring(ring_from_i64(y));
-      auto bits = deal_bits(vu, BitWidth);
+      auto bits = deal_bits(ry, BitWidth);
       for (int k = 0; k < BitWidth; ++k)
         out.two_share[(size_t)BitWidth * i + k] = bits[(size_t)k];
     }

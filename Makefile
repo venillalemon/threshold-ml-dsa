@@ -19,9 +19,8 @@ p     ?= 65
 TEST  ?= 0
 # 编译 adversary:party 1 在打开前修改一个 c share
 TAMPER_C ?= 0
-# 1 = slot-restricted (sign.h), 0 = two-round baseline (sign_2round.h).
-# NOTE: slot mode is being migrated onto the GMW/WRK backend; use SLOT=0 for now.
-SLOT  ?= 0
+# 1 = slot-restricted (sign_slot.h), 0 = two-round baseline (sign_2round.h)
+SLOT  ?= 1
 # 环认证的统计安全参数 sigma(论文取 128)
 SIGMA ?= 128
 # 端口。随机取,避开上一次残留在 TIME_WAIT 里的

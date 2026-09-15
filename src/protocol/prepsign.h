@@ -64,7 +64,7 @@ inline const emp::circuit::BooleanProgram& recover_decompose_program() {
 
 template <int nP> struct PrepSignOut {
   emp::wrk::ShareVec<nP> w0_2;         // OW0-bit GMW shares per coefficient
-  SharePair<nP, Y_WIDTH, false> y;     // <y>: Boolean (y-1) + arithmetic
+  SharePair<nP, Y_WIDTH, true> y;      // Boolean = bin(R_y), arithmetic = y = gamma1 - R_y
   std::vector<uint32_t> w1;            // public HighBits
 };
 

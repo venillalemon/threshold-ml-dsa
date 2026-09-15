@@ -4,7 +4,7 @@
 #include "backend.h"
 #include "keygen.h"
 #if MLDSA_SLOT
-#include "sign.h"
+#include "sign_slot.h"
 #else
 #include "sign_2round.h"
 #endif

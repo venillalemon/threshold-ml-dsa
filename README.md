@@ -31,14 +31,20 @@ ML-DSA 签名**(验证方无需知道签名是 MPC 产的)。
 | `src/infra/backend.h` | `Backend<nP>` | 一个 `NetIOMP` 同时供 GMW(离线电路)、WRK(在线电路)与算术 BDOZ 开启;每方私有 pinned Δ |
 | `src/circuit/wrk_phase2.h` | `wrk_offline` / `wrk_online` | C_post 离线混淆 + 离线开输出掩码;在线一次标签投递后本地解码 |
 | `src/protocol/prepsign.h` | `recover_decompose_program` | A2B + Decompose 编译成一张 GMW 电路 |
-| `src/protocol/sign_2round.h` | `producer_program` | 边界 producer 编译成一张 GMW 电路;C_post 走 WRK 桥 |
+| `src/protocol/sign_2round.h` | `producer_program` | 两轮:边界 producer 一张 GMW 电路;C_post 的 late 输入是**公开的** δ_H(`wrk_online`) |
+| `src/protocol/sign_slot.h` | `slot_producer_program` | slot:producer + one-hot 解码 + 压缩网络 + 空槽 MUX 一张 GMW 电路;C_post 的 late 输入 d^ 由 P1 **free-XOR** u 的标签得到(`wrk_online_routed`) |
 | `third_party/emp-ag/` | `emp::gmw` / `emp::wrk` | vendored WRK 四行 + 认证 GMW 后端(依赖 emp-tool / emp-ot) |
 
-**状态**:两轮模式(`SLOT=0`,即论文 main.pdf 实现)已完整跑通并验证——
-2/3 方 ML-DSA-44 下 KeyGen/Decompose 自检 0 错,电路判定与明文一致,产出的
-(c,z,h) 通过真实 ML-DSA 验证;TAMPER_C 在 checked open 处 abort;在线 2 个
-flight。**slot 模式(`SLOT=1`,sign.h)尚未迁移**到新后端(它的 online 路由
-输入 Dh 是"秘密 late 输入",需要给 WRK 桥加一条在线 masked-open 安装路径)。
+**状态**:两种模式都在新后端上跑通并验证(2/3 方 ML-DSA-44):KeyGen/Decompose
+自检 0 错,电路判定与明文一致,产出的 (c,z,h) 通过真实 ML-DSA 验证,TAMPER_C 在
+checked open 处 abort,**在线都是 2 个 flight**。
+
+slot 模式的 C_post 里,d^_j[ℓ] = ⊕_{i: δ_H,i[ℓ]=1} u_{j,i} 由 P1 对 u 的活标签做
+free-XOR 得到,零个门、无 PublicBits(与 slot 论文 Fig. 1 一致)。与论文文字唯一
+的出入:d^ 后面每根线接一个 `AND 1` 缓冲门,把依赖路由的掩码换成新鲜掩码——这
+NS·ν = 576 个门(ML-DSA-44)的表只能在 flight 1 之后由混淆方本地造好、随 flight 2
+一起发给 P1;其余(加法器、AND 树、r·bin23(ρ))全部离线混淆。代价是 online 门数
+24,127 → 24,703、n=3 在线通信 0.27 → 0.38 MB,轮数仍是 2。
 
 ## 仓库结构
 
@@ -77,7 +83,8 @@ threshold-ml-dsa/
 |---|---|---|
 | `keygen.h` | Π_MLDSA.KeyGen | dealer 采 s/e 并发环份额,**明文**算 t = A·s+e,Power2Round,产出 pk 与 `KeyPair`(零网络) |
 | `prepsign.h` | Π_PrepSign | 离线预处理:采 y/e_w、w = Ay+e_w、A2B、Decompose,返回 (⟨w₀⟩₂, w₁, ⟨y⟩₂) |
-| `sign.h` | Π_MLDSA.Sign | 在线签名(T=1):挑战 c、r₀/z 拒绝电路(只公开判定位)、开 z、MakeHint |
+| `sign_2round.h` | Π_TwoRound(main.pdf) | 两轮签名:producer(GMW)→ C_post(WRK,δ_H 公开 late 输入)→ 挑战、flight 1 开 δ_H、flight 2 投标签、本地解码、MakeHint |
+| `sign_slot.h` | Π_Slot(slot pdf Fig. 1) | slot 签名:producer+解码+压缩(GMW)→ C_post(WRK,u 固定输入、d^ 由 free-XOR 路由)→ 同上,flight 2 携带 576 个缓冲门的表 |
 
 分层依赖自下而上:`infra → circuit → protocol → main.cpp`。
 
@@ -127,7 +134,7 @@ make n=3 TEST=1 TAMPER_C=1   # 对抗测试:party 1 篡改一个 share,MACCheck 
 make clean
 ```
 
-默认走两轮模式(`SLOT=0`);slot 模式尚未迁移(见上「混合安全后端」)。
+默认 slot 模式(`SLOT=1`),`SLOT=0` 切两轮基线。
 端口每次随机(避开上一轮 TIME_WAIT);要固定就 `PORT=16400`。
 
 后端自身还有独立联网自检(2/3/5 方的 GMW COT+open、`gmw.evaluate`、

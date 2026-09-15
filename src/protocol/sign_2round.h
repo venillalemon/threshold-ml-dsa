@@ -234,7 +234,7 @@ inline const auto& phase2_circuit() {
 inline const emp::circuit::BooleanProgram& phase2_program() { return phase2_circuit().program(); }
 
 // C_prod: the pre-challenge boundary producers, as one offline GMW circuit.
-// Inputs  [y(=v) : Y_WIDTH*Y_COEFF_COUNT][w0 : OW0*COEFF_COUNT]
+// Inputs  [R_y : Y_WIDTH*Y_COEFF_COUNT][w0 : OW0*COEFF_COUNT]
 //         [R_H^z : RING_K*Y_COEFF_COUNT][R_H^w : RING_K*COEFF_COUNT].
 // Outputs [B : BW][Mz : MZW][Mw : MWW]  (retained as C_post's fixed inputs).
 inline const emp::circuit::BooleanProgram& producer_program() {
@@ -253,12 +253,10 @@ inline const emp::circuit::BooleanProgram& producer_program() {
     outMz.reserve(MZW);
     outMw.reserve(MWW);
     {
-      Bit v[Y_WIDTH], U[Y_WIDTH], R[RING_K], B[Y_WIDTH], M[RING_K];
+      Bit U[Y_WIDTH], R[RING_K], B[Y_WIDTH], M[RING_K];
       for (int idx = 0; idx < Y_COEFF_COUNT; ++idx) {
-        for (int k = 0; k < Y_WIDTH; ++k)
-          v[k] = wire_bit(ctx, y_base + (uint32_t)(Y_WIDTH * idx + k));
-        for (int k = 0; k < Y_WIDTH; ++k) // U = gamma1 - y = ~v, top bit restored
-          U[k] = k < Y_WIDTH - 1 ? !v[k] : v[k];
+        for (int k = 0; k < Y_WIDTH; ++k) // the eDaBit's Boolean half IS R_y = U^z (paper)
+          U[k] = wire_bit(ctx, y_base + (uint32_t)(Y_WIDTH * idx + k));
         for (int k = 0; k < RING_K; ++k)
           R[k] = wire_bit(ctx, rhz_base + (uint32_t)(RING_K * idx + k));
         window_producer<Y_WIDTH, SPAN_Z>(ctx, U, R, B, M);
