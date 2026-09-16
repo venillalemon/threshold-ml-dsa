@@ -332,7 +332,8 @@ struct NoopHook {
 template <int nP, class Hook = NoopHook>
 inline Signature sign(Backend<nP>& bk, int party, FakeDealer<nP>& dealer, KeyPair<nP>& kp,
                       const std::vector<uint32_t>& msg, Hook after_prepsign = Hook{},
-                      int64_t* online_rounds_out = nullptr, int64_t* g2_ands_out = nullptr) {
+                      int64_t* online_rounds_out = nullptr, int64_t* g2_ands_out = nullptr,
+                      int64_t* g1_ands_out = nullptr) {
   Signature sig;
 
 #ifdef TEST
@@ -408,8 +409,8 @@ inline Signature sign(Backend<nP>& bk, int party, FakeDealer<nP>& dealer, KeyPai
         w1[(size_t)i] |= (uint32_t)w1bits[(size_t)(i * OW1 + k)] << k;
   }
   emp::wrk::ShareVec<nP> bm(outs.begin() + W1W, outs.begin() + W1W + (size_t)(BW + MZW + MWW));
-  if (party == 1)
-    std::printf("G1 C_pre ands=%llu\n", (unsigned long long)(bk.gmw().ands_evaluated - and_a0));
+  if (g1_ands_out)
+    *g1_ands_out = (int64_t)(bk.gmw().ands_evaluated - and_a0);
 
 #ifdef TEST
   { // Decompose oracle: the circuit's (w1, w0) must equal FIPS Decompose(w).

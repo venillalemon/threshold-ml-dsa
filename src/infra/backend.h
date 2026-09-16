@@ -83,6 +83,19 @@ public:
 
   // Total bytes this party has moved on the mesh (sent + received).
   int64_t comm_bytes() { return io_.count(); }
+  // Bytes this party has SENT / RECEIVED on the mesh (both channels per peer).
+  int64_t bytes_sent() {
+    int64_t r = 0;
+    for (int i = 1; i <= nP; ++i)
+      if (i != party_) r += io_.ios[i]->send_counter + io_.ios2[i]->send_counter;
+    return r;
+  }
+  int64_t bytes_recv() {
+    int64_t r = 0;
+    for (int i = 1; i <= nP; ++i)
+      if (i != party_) r += io_.ios[i]->recv_counter + io_.ios2[i]->recv_counter;
+    return r;
+  }
 
 private:
   int party_;
