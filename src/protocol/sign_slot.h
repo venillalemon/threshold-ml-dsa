@@ -196,10 +196,11 @@ inline void compact(std::vector<std::array<Bit_T<Ctx>, VW>>& A,
 // u is never read by a gate: it is installed so P1 holds its labels and every
 // party its masks, and d^[j][l] = XOR_{i: delta_H,i[l]=1} u[j][i] is formed by
 // free XOR online (paper: "the evaluator forms it by XOR-ing active labels it
-// already holds"). The FIRST NS*RING_K AND gates are the buffers
-// d^' = d^ AND 1, re-garbled after flight 1; everything after them
-// (K_j = M^_j + d^'_j, r = AND_j K_j[top], Z_out = r * bin23(rho)) is garbled
-// offline against the buffers' fresh output masks.
+// already holds"). The d^ ports carry fresh offline masks; flight 2 is the
+// re-masking that moves P1 from the XORed u wires onto those ports (one
+// 1+16n-byte block per port per garbler, wrk_online_routed). Every gate
+// (K_j = M^_j + d^_j, r = AND_j K_j[top], Z_out = r * bin23(rho)) is garbled
+// offline.
 inline const emp::circuit::BooleanProgram& phase2_program() {
   using Ctx = emp::RecordCtx;
   using Bit = emp::Bit_T<Ctx>;
@@ -207,18 +208,13 @@ inline const emp::circuit::BooleanProgram& phase2_program() {
   static const emp::circuit::BooleanProgram prog = [] {
     Ctx ctx;
     const uint32_t base = ctx.external_input((uint32_t)P2_IN);
-    const Bit one = Bit::constant(ctx, true);
-    // Buffers first: AND index j*RING_K + l  (the routed-online contract).
-    std::vector<Bit> dhp((size_t)DHW);
-    for (int w = 0; w < DHW; ++w)
-      dhp[(size_t)w] = wire_bit(ctx, base + P2_DH + (uint32_t)w) & one;
     // Slot adders + conjunction.
     std::vector<Bit> ok((size_t)NS);
     Bit a[RING_K], b[RING_K], Kk[RING_K];
     for (int j = 0; j < NS; ++j) {
       for (int k = 0; k < RING_K; ++k) {
         a[k] = wire_bit(ctx, base + P2_MH + (uint32_t)(j * RING_K + k));
-        b[k] = dhp[(size_t)(j * RING_K + k)];
+        b[k] = wire_bit(ctx, base + P2_DH + (uint32_t)(j * RING_K + k));
       }
       add_ripple<RING_K>(ctx, Kk, a, b, false);
       ok[(size_t)j] = Kk[RING_K - 1];
@@ -566,8 +562,8 @@ inline Signature sign(Backend<nP>& bk, int party, FakeDealer<nP>& dealer, KeyPai
   open_ring_and_fq(bk.io(), party, dealer.my_alpha_r, dealer.my_alpha_f, dh, vbar_sh, opened, vbar);
 
   // Routing: S[l] = { i : delta_H,i[l] = 1 } -- the PUBLIC coefficients of
-  // d^_j[l] = XOR_{i in S[l]} u[j][i]. Flight 2: garblers re-garble the NS*RING_K
-  // buffers and ship the rows; P1 forms d^ by free XOR, evaluates, decodes.
+  // d^_j[l] = XOR_{i in S[l]} u[j][i]. Flight 2: garblers send the re-masking
+  // blocks for the d^ ports; P1 forms d^ by free XOR, evaluates, decodes.
   std::vector<std::vector<int>> S((size_t)RING_K);
   for (int l = 0; l < RING_K; ++l)
     for (int i = 0; i < M_TOTAL; ++i)
@@ -576,7 +572,7 @@ inline Signature sign(Backend<nP>& bk, int party, FakeDealer<nP>& dealer, KeyPai
   auto res = wrk_online_routed<nP>(bk, off, P2_U, (uint32_t)M_TOTAL, P2_DH, (uint32_t)RING_K,
                                    (uint32_t)NS, S);
   if (online_rounds_out)
-    *online_rounds_out = 2; // flight 1 (delta_H, V), flight 2 (buffer rows)
+    *online_rounds_out = 2; // flight 1 (delta_H, V), flight 2 (d^ re-masking)
   if (party != 1)
     return sig;
   emp::expecting(res.has_value(), "Sign: online evaluation failed");

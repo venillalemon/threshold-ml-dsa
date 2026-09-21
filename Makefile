@@ -23,6 +23,8 @@ TAMPER_C ?= 0
 SLOT  ?= 1
 # 环认证的统计安全参数 sigma(论文取 128)
 SIGMA ?= 128
+# GMW 三元组用的 OT 扩展:SoftSpoken(默认,最快) | Ferret(offline 流量少 28%,n=7 慢 3.5 倍,每方多 300 MB) | IKNP
+OT    ?= SoftSpoken
 # 端口。随机取,避开上一次残留在 TIME_WAIT 里的
 PORT  ?= $(shell awk 'BEGIN{srand();print 20000+int(rand()*400)*100}')
 
@@ -51,6 +53,7 @@ help:
 	@echo '  make n=3 p=44     换 ML-DSA-44(默认 65)'
 	@echo '  make n=3 TEST=1   测试构建:打开 y/e_w/w/w0 并做自检'
 	@echo '  make n=3 TEST=1 TAMPER_C=1   编译 adversary share 篡改测试'
+	@echo '  make n=7 OT=Ferret   换 Ferret OT(offline 流量少 28%,慢 3.5 倍)'
 	@echo '  (系数个数 N 硬编码在 decompose.h: constexpr int N)'
 	@echo '  make clean        删掉 build/'
 	@echo '  make format       clang-format 就地格式化(用 mldsa/.clang-format)'
@@ -65,13 +68,14 @@ configure:
 	       -DMLDSA_TEST=$(if $(filter 1,$(TEST)),ON,OFF) \
 	       -DMLDSA_TAMPER_C=$(if $(filter 1,$(TAMPER_C)),ON,OFF) \
 	       -DMLDSA_SLOT=$(if $(filter 1,$(SLOT)),ON,OFF) -DMLDSA_SIGMA=$(SIGMA) \
+	       -DEMP_AG_OT_BACKEND=$(OT) \
 	       -DMLDSA_DRIVER=ON -DMLDSA_TESTS=OFF >/dev/null
 	@# p=/TEST= 换配置只改 -D,cmake 的 Makefile 生成器靠 mtime 判断要不要重编,
 	@# 而重新生成的 flags.make 可能和上一次的 .o 落在同一秒 —— make 只在依赖
 	@# 严格更新时才动手,于是静默沿用旧二进制。配置真变了就删掉 .o。
-	@if [ "$$(cat $(BUILD)/.param 2>/dev/null)" != "$(PARAM)-TEST$(TEST)-TAMPER_C$(TAMPER_C)-SLOT$(SLOT)-S$(SIGMA)" ]; then \
+	@if [ "$$(cat $(BUILD)/.param 2>/dev/null)" != "$(PARAM)-TEST$(TEST)-TAMPER_C$(TAMPER_C)-SLOT$(SLOT)-S$(SIGMA)-$(OT)" ]; then \
 	    rm -f $(BUILD)/CMakeFiles/main*.dir/main.cpp.o; \
-	    echo $(PARAM)-TEST$(TEST)-TAMPER_C$(TAMPER_C)-SLOT$(SLOT)-S$(SIGMA) > $(BUILD)/.param; \
+	    echo $(PARAM)-TEST$(TEST)-TAMPER_C$(TAMPER_C)-SLOT$(SLOT)-S$(SIGMA)-$(OT) > $(BUILD)/.param; \
 	fi
 
 # ---- n 方恶意 ---------------------------------------------------------------

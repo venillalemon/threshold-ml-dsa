@@ -14,9 +14,11 @@
 //     selected labels (wrk_online).
 //   * slot mode: the late ports are the routed residues d^ = XOR of retained u
 //     wires with PUBLIC coefficients (delta_H). P1 forms d^'s active labels and
-//     masked bits itself by free XOR; the only gates whose garbling depends on
-//     the routing are one "AND 1" re-masking buffer per d^ wire, and garblers
-//     garble just those after flight 1 and ship the rows (wrk_online_routed).
+//     masked bits itself by free XOR; the ports themselves carry fresh offline
+//     masks, so every gate is garbled offline, and flight 2 only carries the
+//     re-masking from the XORed u wires onto the ports: one 1+16n-byte block
+//     per port per garbler, the same content as one garbled row without the
+//     padding (wrk_online_routed).
 //
 // The circuit itself is supplied as a compiled emp-tool BooleanProgram; this
 // file is parameter- and mode-agnostic (sign_slot.h and sign_2round.h use it).
@@ -130,12 +132,10 @@ template <int nP> struct WrkOffline {
   // late_routed: then they are formed online by free XOR of retained fixed
   // wires and their placeholder masks are never opened (wrk_online_routed).
   bool late_routed = false;
-  // Retained WRK preprocessing: everyone's wire-mask shares (input_masks,
-  // and_masks, products) and, at garblers, the zero labels. Needed by
-  // wrk_online_routed to re-garble the buffer gates after the routing is known.
-  // NB: a buffer's product is a fresh authenticated sharing of ZERO -- value 0
-  // but real MACs -- and prepare_local folded it into P1's ev_base, so the
-  // garbler must fold the identical share into its row base.
+  // Retained WRK preprocessing: everyone's wire-mask shares and, at garblers,
+  // the zero labels. wrk_online_routed needs input_masks (u and d^ ports) and
+  // input_labels0 (garblers) to build the re-masking blocks once the routing
+  // is known.
   emp::wrk::LocalPreprocessing<nP> local;
 };
 
@@ -329,85 +329,89 @@ wrk_online(Backend<nP>& bk, WrkOffline<nP>& off, const std::vector<uint8_t>& lat
 // ---- online, ROUTED late ports (slot mode) ----------------------------------
 //
 // Port layout the caller guarantees: u[j][i] is fixed port u_base + j*M + i
-// (installed offline, never read by a gate), d^[j][l] is late port
-// dh_base + j*K + l, and the FIRST NS*K AND gates of the program are the
-// buffers d^'[j][l] = d^[j][l] AND 1, in that order (AND index j*K + l).
-// S[l] lists the coefficients i with delta_H,i[l] = 1 (public after flight 1).
+// (installed offline, never read by a gate) and d^[j][l] is late port
+// dh_base + j*K + l, read by the offline-garbled gates under its own fresh
+// mask lambda_f (sampled offline like any input port). S[l] lists the
+// coefficients i with delta_H,i[l] = 1 (public after flight 1).
 //
-// d^[j][l] = XOR_{i in S[l]} u[j][i]. By free XOR its wire mask is the XOR of
-// the u masks and its active label the XOR of the u labels -- both local for
-// everyone. The buffer gate is the only gate that reads d^, and its rows are
-// affine in that mask (its other input is the constant 1, so there is no mask
-// product), so each garbler re-garbles the NS*K buffers now and ships the rows;
-// everything downstream was garbled offline against the buffers' fresh output
-// masks. One garbler->P1 flight; no labels are needed (P1 forms them).
+// d^[j][l] = XOR_{i in S[l]} u[j][i]. By free XOR P1 holds, for every garbler
+// i, the active label L_i(d) = L_i,0(d) ^ Lambda_d * Delta_i and the masked
+// bit Lambda_d = x ^ lambda_d, where lambda_d = XOR of the u masks (shared).
+// What the offline-garbled gates need is the same x under the port's mask:
+//   Lambda_f = Lambda_d ^ delta,               delta = lambda_d ^ lambda_f,
+//   L_i(f)   = L_i(d) ^ [L_i,0(f) ^ L_i,0(d) ^ delta * Delta_i].
+// delta is only ever shared, so P1 assembles delta*Delta_i from the MACs the
+// way evaluate() assembles a row: each garbler i sends, per port,
+//   [bit of its delta share][its MACs on that share, one per other party]
+//   [L_i,0(f) ^ L_i,0(d) ^ bit*Delta_i ^ XOR of its keys on the others' shares]
+// = 1 + 16*nP bytes, the plaintext of one WRK row (no padding: there is a
+// single block per port and P1 is entitled to it). P1 checks every bit
+// against its own key, so a lying garbler is caught here; a wrong label is
+// caught by the next row's MAC check. One garbler->P1 flight.
 template <int nP>
 inline std::optional<std::vector<uint8_t>>
 wrk_online_routed(Backend<nP>& bk, WrkOffline<nP>& off, uint32_t u_base, uint32_t M,
                   uint32_t dh_base, uint32_t K, uint32_t NS,
                   const std::vector<std::vector<int>>& S) {
   using emp::wrk::AuthShare;
+  using emp::wrk::peer_slot;
   using emp::wrk::xor_share;
   const int party = bk.party();
   const emp::block Delta = bk.delta();
-  const uint32_t NB = NS * K; // buffer gates == routed ports
+  const uint32_t NB = NS * K; // routed ports
   emp::expecting(off.late_routed && off.late_inputs == NB && dh_base == off.fixed_inputs &&
                      S.size() == K,
                  "wrk_online_routed: port layout mismatch");
-  const size_t rb = emp::wrk::row_bytes<nP>();
+  constexpr size_t blk = 1 + size_t(16) * nP; // one re-masking block
 
-  // Everyone: the routed masks (own share) per buffer.
-  emp::wrk::ShareVec<nP> alpha((size_t)NB);
+  // Everyone: own share of delta = lambda_d ^ lambda_f per port.
+  emp::wrk::ShareVec<nP> dsh((size_t)NB);
   for (uint32_t j = 0; j < NS; ++j)
     for (uint32_t l = 0; l < K; ++l) {
-      AuthShare<nP> a{};
+      const uint32_t w = j * K + l;
+      AuthShare<nP> a = off.local.input_masks[dh_base + w];
       for (int i : S[l])
         a = xor_share(a, off.local.input_masks[u_base + j * M + (uint32_t)i]);
-      alpha[j * K + l] = a;
+      dsh[w] = a;
     }
-  const AuthShare<nP> beta{}; // the constant-1 wire has mask 0
 
   if (party != 1) {
-    // Garbler: re-garble the NB buffers (AND index ai = w) and ship the rows.
-    std::vector<uint8_t> rows((size_t)4 * NB * rb);
-    const emp::block Lconst1 = Delta; // prepare_local's label for Const1
+    std::vector<uint8_t> out((size_t)NB * blk);
     for (uint32_t j = 0; j < NS; ++j)
       for (uint32_t l = 0; l < K; ++l) {
-        const uint32_t w = j * K + l, ai = w;
-        emp::block Lx0 = emp::zero_block;
+        const uint32_t w = j * K + l;
+        emp::block corr = off.local.input_labels0[dh_base + w]; // L_0(f)
         for (int i : S[l])
-          Lx0 = Lx0 ^ off.local.input_labels0[u_base + j * M + (uint32_t)i];
-        // Same base prepare_local used for P1's ev_base: products ^ and_mask.
-        const AuthShare<nP> base = xor_share(off.local.products[ai], off.local.and_masks[ai]);
-        for (unsigned row = 0; row < 4; ++row) {
-          const bool u = row >> 1, v = row & 1;
-          const auto share =
-              emp::wrk::detail::row_share<nP>(base, alpha[w], beta, u, v, party, Delta);
-          auto target = std::span(rows).subspan((size_t)(4 * w + row) * rb, rb);
-          emp::wrk::detail::row_pad(target, off.gc.hash_seed, ai, row, (uint64_t)party,
-                                    Lx0 ^ (emp::select_mask[u] & Delta),
-                                    Lconst1 ^ (emp::select_mask[v] & Delta));
-          std::vector<uint8_t> plaintext(rb, 0);
-          plaintext[0] = share.bit;
-          emp::block self = off.local.and_labels0[ai] ^ (emp::select_mask[share.bit] & Delta);
-          for (int peer = 1; peer <= nP; ++peer)
-            if (peer != party) {
-              const int slot = emp::wrk::peer_slot(party, peer);
-              emp::wrk::detail::put_block(plaintext.data() + 1 + 16 * slot, share.mac(slot));
-              self = self ^ share.key(slot);
-            }
-          emp::wrk::detail::put_block(plaintext.data() + 1 + 16 * (nP - 1), self);
-          for (size_t t = 0; t < rb; ++t)
-            target[t] ^= plaintext[t];
-        }
+          corr = corr ^ off.local.input_labels0[u_base + j * M + (uint32_t)i]; // ^ L_0(d)
+        const AuthShare<nP>& sh = dsh[w];
+        uint8_t* b = out.data() + (size_t)w * blk;
+        b[0] = sh.bit;
+        corr = corr ^ (emp::select_mask[sh.bit] & Delta);
+        for (int peer = 1; peer <= nP; ++peer)
+          if (peer != party) {
+            const int slot = peer_slot(party, peer);
+            emp::wrk::detail::put_block(b + 1 + 16 * slot, sh.mac(slot));
+            corr = corr ^ sh.key(slot);
+          }
+        emp::wrk::detail::put_block(b + 1 + 16 * (nP - 1), corr);
       }
-    bk.io().send_data(1, rows.data(), rows.size());
+    bk.io().send_data(1, out.data(), out.size());
     bk.io().flush(1);
     return std::nullopt;
   }
 
-  // P1: form d^'s masked bits + active labels by free XOR, patch its own
-  // buffer-gate operand shares, receive the re-garbled rows, evaluate, decode.
+  // P1: receive every garbler's blocks.
+  std::array<std::vector<uint8_t>, nP + 1> in;
+  std::vector<std::future<void>> jobs;
+  for (int peer = 2; peer <= nP; ++peer) {
+    in[peer].resize((size_t)NB * blk);
+    jobs.push_back(bk.pool()->enqueue(
+        [&, peer] { bk.io().recv_data(peer, in[peer].data(), in[peer].size()); }));
+  }
+  for (auto& jb : jobs)
+    jb.get();
+
+  // P1: d^ by free XOR, then re-mask onto the ports.
   const uint32_t n_in = off.fixed_inputs + off.late_inputs;
   std::array<emp::BlockVec, nP + 1> labels;
   for (int peer = 2; peer <= nP; ++peer) {
@@ -425,22 +429,31 @@ wrk_online_routed(Backend<nP>& bk, WrkOffline<nP>& off, uint32_t u_base, uint32_
         for (int peer = 2; peer <= nP; ++peer)
           lab[peer] = lab[peer] ^ off.gc.fixed_input_labels[peer][up];
       }
-      off.gc.input_masked[port] = lam;
-      for (int peer = 2; peer <= nP; ++peer)
-        labels[peer][port] = lab[peer];
-      off.gc.ev_alpha[w] = alpha[w]; // ai == w; ev_beta (const 1) and ev_base unchanged
+      // delta: own share bit + every garbler's, each checked under P1's key.
+      const AuthShare<nP>& mine = dsh[w];
+      uint8_t delta = mine.bit;
+      for (int peer = 2; peer <= nP; ++peer) {
+        const uint8_t* b = in[peer].data() + (size_t)w * blk;
+        emp::expecting(b[0] <= 1, "wrk_online_routed: noncanonical re-mask bit");
+        const emp::block expect = mine.key(peer_slot(1, peer)) ^ (emp::select_mask[b[0]] & Delta);
+        const emp::block got = emp::wrk::detail::get_block(b + 1 + 16 * peer_slot(peer, 1));
+        emp::expecting(emp::cmpBlock(&expect, &got, 1),
+                       "wrk_online_routed: re-mask MAC verification failed");
+        delta ^= b[0];
+      }
+      off.gc.input_masked[port] = (uint8_t)(lam ^ delta);
+      // labels: L(d) ^ corr_dest ^ (all MACs on the others' shares under Delta_dest)
+      for (int dest = 2; dest <= nP; ++dest) {
+        const uint8_t* bd = in[dest].data() + (size_t)w * blk;
+        emp::block v = emp::wrk::detail::get_block(bd + 1 + 16 * (nP - 1));
+        v = v ^ mine.mac(peer_slot(1, dest));
+        for (int src = 2; src <= nP; ++src)
+          if (src != dest)
+            v = v ^ emp::wrk::detail::get_block(in[src].data() + (size_t)w * blk + 1 +
+                                                16 * peer_slot(src, dest));
+        labels[dest][port] = lab[dest] ^ v;
+      }
     }
-  std::vector<std::future<void>> jobs;
-  for (int peer = 2; peer <= nP; ++peer)
-    jobs.push_back(bk.pool()->enqueue([&, peer] {
-      std::vector<uint8_t> rows((size_t)4 * NB * rb);
-      bk.io().recv_data(peer, rows.data(), rows.size());
-      for (uint32_t w = 0; w < NB; ++w)
-        std::copy_n(rows.data() + (size_t)4 * w * rb, 4 * rb,
-                    off.gc.rows.data() + emp::wrk::row_offset<nP>(w, peer, 0));
-    }));
-  for (auto& jb : jobs)
-    jb.get();
 
   std::vector<uint8_t> masked = emp::wrk::evaluate(off.gc, *off.prog, labels, bk.pool());
   emp::expecting(masked.size() == off.out_mask_opened.size(), "wrk_online_routed: output width");
