@@ -24,7 +24,7 @@ SLOT  ?= 1
 # 环认证的统计安全参数 sigma(论文取 128)
 SIGMA ?= 128
 # GMW 三元组用的 OT 扩展:SoftSpoken(默认,最快) | Ferret(offline 流量少 28%,n=7 慢 3.5 倍,每方多 300 MB) | IKNP
-OT    ?= SoftSpoken
+OT    ?= Ferret
 # 端口。随机取,避开上一次残留在 TIME_WAIT 里的
 PORT  ?= $(shell awk 'BEGIN{srand();print 20000+int(rand()*400)*100}')
 

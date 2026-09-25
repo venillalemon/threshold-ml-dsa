@@ -1,0 +1,235 @@
+% LaTeX version of slot-protocol-figure_3.pdf, written for the protocol that
+% threshold-ml-dsa implements (src/protocol/sign_slot.h, src/circuit/wrk_phase2.h).
+% The notation of the original figure is kept. Added: the superscripts BDOZ/WRK on
+% every share, and the explicit conversions between the two representations.
+\documentclass[10pt,letterpaper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{enumitem}
+\usepackage{mdframed}
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5pt}
+\setlist[enumerate]{leftmargin=27pt,itemsep=4pt,topsep=6pt,parsep=0pt}
+\newcommand{\typedshare}[3]{\mathopen{[\![}#1\mathclose{]\!]}_{#2}^{\mathsf{#3}}}
+\newcommand{\sh}[2]{\typedshare{#1}{#2}{BDOZ}}
+\newcommand{\ws}[1]{\typedshare{#1}{2}{WRK}}
+\newcommand{\vct}[1]{\bm{#1}}
+\newcommand{\one}{\mathbf{1}}
+\newcommand{\bin}{\operatorname{bin}}
+\newcommand{\shift}{\operatorname{shift}}
+\newcommand{\cnt}{\operatorname{cnt}}
+\newcommand{\ovf}{\operatorname{ovf}}
+\newcommand{\Open}{\mathsf{Open}}
+\newcommand{\BoolEval}{\mathsf{BoolEval}}
+\newcommand{\pre}{C_{\mathrm{pre}}}
+\newcommand{\post}{C_{\mathrm{post}}}
+\newcommand{\dall}{d_{\mathrm{all}}}
+\newcommand{\routed}{\bigoplus_{i:\,\delta_{H,i}[\ell]=1}}
+\mdfdefinestyle{protocol}{linewidth=.6pt,leftline=true,rightline=true,topline=true,bottomline=true,innerleftmargin=6pt,
+ innerrightmargin=6pt,innertopmargin=5pt,innerbottommargin=5pt,
+ skipabove=0pt,skipbelow=0pt,nobreak=false,splittopskip=8pt,splitbottomskip=6pt}
+
+\begin{document}
+\begin{mdframed}[style=protocol]
+\begin{center}
+\underline{\textbf{Protocol }$\Pi_{\mathrm{Slot}}^{\mathcal{F}_{\mathsf{AuthField\text{-}Ring\text{-}Bool}}}$}
+\end{center}
+\textbf{Setup state.} Fix the MLDSA parameters, matrix $A$, message representative
+$\mu$, slot count $N_s$, and agreed circuits $\pre,\post$. Key generation supplies
+$\sh{\vct{s}}{D},\sh{\vct{e}}{D}$ with coefficients in $[-\eta,\eta]$ and
+$\sh{\vct{s}}{q}$, all bound to the same public key and common $\vct{t},\vct{t}_0$.
+Let $\dall=\langle P_1,\ldots,P_n\rangle$. $P_1$ evaluates $\post$; $P_2,\ldots,P_n$
+garble it. Every $P_p$ holds a global key $\Delta_p\in\{0,1\}^{128}$.
+
+\textbf{Representations.}
+$\ws{x}$ is the WRK encoding of a wire carrying the bit $x$: all parties hold
+$\sh{\lambda_x}{2}$; each garbler $P_p$ holds a zero label $L_p^0(x)$;
+$P_1$ holds $t_x=x\oplus\lambda_x$ and $L_p(x)=L_p^0(x)\oplus t_x\Delta_p$.
+For bit vectors, bitwise.
+
+\textbf{Before the challenge.}
+\begin{enumerate}
+\item All parties invoke the following four commands. Each returned authenticated
+vector pair is shown on the left:
+\begin{align*}
+(\sh{\vct{R}_y}{q},\sh{\bin_a(\vct{R}_y)}{2})
+ &\leftarrow \mathsf{eDaBit}(q,a,n_z),\\
+(\sh{\vct{R}_w}{q},\sh{\bin_{23}(\vct{R}_w)}{2})
+ &\leftarrow \mathsf{eDaBit}(q,23,n_w),\\
+(\sh{\vct{R}_H}{D},\sh{\bin_\nu(\vct{R}_H)}{2})
+ &\leftarrow \mathsf{eDaBit2k}(\nu,m),\\
+(\sh{\vct{\rho}}{q},\sh{\bin_{23}(\vct{\rho})}{2})
+ &\leftarrow \mathsf{eDaBit}(q,23,n_z),
+\end{align*}
+and $\sh{\vct{e}_w}{q}$ with coefficients uniform in $[-\eta,\eta]$
+(dealt directly; no Boolean half of $\vct{e}_w$ is used).
+The fourth supplies the response pad $\vct{\rho}$, used for one challenge only.
+\item Locally compute
+\begin{align*}
+\sh{\vct{y}}{q}&=\gamma_1\one-\sh{\vct{R}_y}{q},\\
+\sh{\vct{w}}{q}&=A\sh{\vct{y}}{q}+\sh{\vct{e}_w}{q},\\
+\sh{\vct{\delta}_w}{q}&=\sh{\vct{w}}{q}+\sh{\vct{R}_w}{q}.
+\end{align*}
+Invoke $(\Open,\sh{\vct{\delta}_w}{q},\dall)$.
+(The implementation pads with $+\vct{R}_w$; the figure pads with $-\vct{R}_w$.)
+\item Invoke $\BoolEval$ on $\pre$, using
+$\sh{\bin_a(\vct{R}_y)}{2}$, $\sh{\bin_{23}(\vct{R}_w)}{2}$, $\sh{\bin_\nu(\vct{R}_H)}{2}$
+as inputs and the coefficients of $\vct{\delta}_w$ as public constants.
+All operations below are applied coefficientwise:
+\begin{align*}
+\vct{w}&=(\vct{\delta}_w-\vct{R}_w)\bmod q,\\
+(\vct{w}_1,\vct{w}_0)&=\mathsf{Decompose}(\vct{w},2\gamma_2),\\
+\vct{M}&=\vct{R}_H+\bigl(\shift(\vct{R}_y,2\gamma_1)
+ \mathbin\Vert\shift(\gamma_2\one-\vct{w}_0,2\gamma_2)\bigr)\pmod D,\\
+\partial_i&=[\,U_i\leq2\beta\,]\lor[\,U_i\geq S_i-2\beta\,],\\
+\cnt_i&=\sum_{k<i}\partial_k,\\
+u_{j,i}&=\partial_i\land[\,\cnt_i=j\,],\\
+\widehat M_j&=\Bigl(\bigoplus_i u_{j,i}M_i\Bigr)
+ \oplus\Bigl(L\cdot\bigl[\,\textstyle\sum_i u_{j,i}=0\,\bigr]\Bigr),\\
+\ovf&=[\,\cnt_m>N_s\,].
+\end{align*}
+Here $U=(\vct{R}_y\mathbin\Vert\gamma_2\one-\vct{w}_0)$ and $\vct{S}$ carry
+the arguments of shift, the slot index runs over $0\leq j<N_s$, and
+$\vct{u}_j=(u_{j,i})_{i<m}$ is one-hot, all zero for an unused slot. The selection
+$\widehat M_j$ is realised by a stable compaction network of
+$m\nu\lceil\log_2m\rceil$ AND gates (202,752 for MLDSA44), not by the literal
+$N_sm\nu$-gate selection circuit. Return only $\sh{\vct{w}_1}{2}$,
+$\{\sh{\vct{u}_j}{2},\sh{\widehat M_j}{2}\}_{j<N_s}$, $\sh{\ovf}{2}$,
+and invoke $(\Open,(\sh{\vct{w}_1}{2},\sh{\ovf}{2}),\dall)$.
+If $\ovf=1$, retire the execution and restart from step 1.
+\end{enumerate}
+\textbf{Conversion $\sh{x}{2}\rightarrow\ws{x}$ (still before the challenge).}
+For every bit $x$ of $\bin_\nu(\widehat M_j)$, $\bin_{23}(\vct{\rho})$ and
+$\vct{u}_j$ ($j<N_s$), which are the fixed inputs of $\post$:
+\begin{align*}
+\sh{\lambda_x}{2}&\leftarrow\mathsf{AuthRandomBit},\qquad
+t_x=\Open\bigl(\sh{x}{2}\oplus\sh{\lambda_x}{2},\dall\bigr),\\
+P_p\rightarrow P_1&:\ L_p(x)=L_p^0(x)\oplus t_x\Delta_p .
+\end{align*}
+All $t_x$ are opened in one checked opening. Then garble $\post$ (WRK) offline;
+its late input wires $\widehat\delta_j[\ell]$ get fresh masks that are
+never opened, and its output masks are opened to $P_1$. The $\vct{u}_j$ wires are
+read by no gate of $\post$; they exist only to be XOR-ed in step 6.
+$\sh{\vct{u}_j}{2},\sh{\widehat M_j}{2},\sh{\bin_{23}(\vct{\rho})}{2}$ are then discarded.
+
+\textbf{Retained state.} Retain
+$\{\ws{\vct{u}_j},\ws{\widehat M_j}\}_{j<N_s}$, $\ws{\bin_{23}(\vct{\rho})}$,
+the garbled $\post$,
+$\sh{\vct{R}_H}{D}$, $\sh{\vct{s}}{D}$, $\sh{\vct{e}}{D}$, $\sh{\vct{s}}{q}$,
+$\sh{\vct{y}}{q}$, $\sh{\vct{\rho}}{q}$, and $\vct{w}_1$.
+
+\textbf{After the challenge.}
+\begin{enumerate}[start=4]
+\item \textbf{Challenge.} Compute the parameter-set-specific
+$\widetilde c=\mathsf{H}(\mu\mathbin\Vert\mathsf{w1Encode}(\vct{w}_1))$ and
+$c=\mathsf{SampleInBall}(\widetilde c)$. Bind both to this attempt and the following affine expressions.
+\item \textbf{Flight 1: checked masked openings.} Over $R_D^{\ell+k}$ and
+$R_q^\ell$ respectively, locally compute
+\begin{align*}
+\sh{\vct{\delta}_H}{D}&=
+ \bigl(\beta\one-c\sh{\vct{s}}{D},\;\beta\one+c\sh{\vct{e}}{D}\bigr)
+ -\sh{\vct{R}_H}{D},\\
+\sh{\bar{\vct{V}}}{q}&=(\gamma_1+\beta)\one-\sh{\vct{y}}{q}
+ -c\sh{\vct{s}}{q}+\sh{\vct{\rho}}{q}.
+\end{align*}
+Invoke $(\Open,(\sh{\vct{\delta}_H}{D},\sh{\bar{\vct{V}}}{q}),\dall)$
+once for all $(\ell+k)N$ and $\ell N$ coefficients.
+\item \textbf{Flight 2: routing and local evaluation.} The checked residues
+$\vct{\delta}_H$ fix the routing. For $0\leq j<N_s$ and $0\leq\ell<\nu$, $P_1$
+forms by free XOR of the retained encodings, without communication,
+\[
+\ws{\widehat\delta_j[\ell]}=\routed\ws{u_{j,i}} .
+\]
+Write $d$ for the wire carrying this XOR-ed encoding and $f$ for the input wire
+of the pre-garbled $\post$ that $\widehat\delta_j[\ell]$ enters. Both carry the
+same bit, but $d$ is under $\lambda_d=\bigoplus\lambda_{u_{j,i}}$,
+$L_p^0(d)=\bigoplus L_p^0(u_{j,i})$, while $f$ is under its own
+$\lambda_f,L_p^0(f)$ sampled at garbling time.
+Solder $d$ to $f$: the garblers
+reveal to $P_1$, authenticated, $\varepsilon=\lambda_d\oplus\lambda_f$ and
+$L_p^0(d)\oplus L_p^0(f)\oplus\varepsilon\Delta_p$ (one $1{+}16n$-byte block per
+wire per garbler, sent from its share of $\varepsilon$, MACs and keys), and $P_1$
+swaps mask bit and labels:
+\[
+t_f=t_d\oplus\varepsilon,\qquad
+L_p(f)=L_p(d)\oplus L_p^0(d)\oplus L_p^0(f)\oplus\varepsilon\Delta_p .
+\]
+$P_1$ then evaluates $\post$:
+\begin{align*}
+\ws{K_j}&=\bigl(\ws{\widehat M_j}+\ws{\widehat\delta_j}\bigr)\bmod D,\\
+\ws{r}&=\bigwedge_{j=0}^{N_s-1}\ws{K_j[b]},\\
+\ws{\vct{Z}_{\mathrm{out}}}&=\ws{r}\cdot\ws{\bin_{23}(\vct{\rho})},
+\end{align*}
+and decodes $r,\vct{Z}_{\mathrm{out}}$ locally with the output masks opened to it
+before the challenge. It obtains no individual predicate or rejected response.
+\item \textbf{Completion.} If $r=1$, the evaluator recovers
+$\vct{z}=(\gamma_1+\beta)\one-\bigl((\bar{\vct{V}}-\vct{Z}_{\mathrm{out}})\bmod q\bigr)$
+and locally computes:
+\[
+\vct{d}_0=c\vct{t}_0,\qquad
+\vct{h}=\mathsf{MakeHint}_q(-\vct{d}_0,A\vct{z}-c\vct{t}+\vct{d}_0,2\gamma_2).
+\]
+Reject if $\|\vct{d}_0\|_\infty\geq\gamma_2$, $\mathsf{HW}(\vct{h})>\omega$,
+or public MLDSA verification fails; otherwise return $(\widetilde c,\vct{z},\vct{h})$.
+Retire the backend execution after this decision.
+\end{enumerate}
+\end{mdframed}
+\begin{center}\small
+Figure 1: The slot-restricted signing attempt. Only steps 3, 5 and 6 differ from the two-round protocol.
+\end{center}
+
+\textbf{The idea.} By the three cases of shift in Equation (3), a coefficient
+with $2\beta<U_i<S_i-2\beta$ accepts for every reachable $H$, so its online test
+is redundant; only the $\partial_i=1$ coefficients can fail, and in expectation
+there are fewer than 3.3 of them out of $m\geq2048$. Step 3 compacts these into
+$N_s$ slots fixed before the challenge. Two things keep the attempt at two flights.
+First, the routing $\vct{u}_j\mapsto\widehat\delta_j$ is $\mathbb{F}_2$-linear
+with coefficients that become public only at flight 1, so the evaluator forms it
+by XOR-ing active labels it already holds: the XOR routing itself needs no AND
+gate and no garbling material, and there is no $\mathsf{PublicBits}$ input.
+Second, the response no longer rides on the boundary sum through base; it travels
+through the field one-time pad $\vct{\rho}$, whose masked value $\bar{\vct{V}}$
+is opened in flight 1 and whose release the circuit gates on $r$. Phase 2 therefore
+carries $N_sb$ masked-sum gates in place of $mb$, and no response additions at all.
+\newpage
+
+\textbf{Choosing $N_s$.} Write $m_\partial=\cnt_m$. Since $U_i$ is uniform on
+$2\gamma_1$ values for a response coefficient and on $2\gamma_2+1$ values for a
+low-bit coefficient,
+\[
+p_z=\frac{4\beta+1}{2\gamma_1},\qquad
+p_w=\frac{4\beta+2}{2\gamma_2+1},\qquad
+\lambda=\mathbb{E}[m_\partial]=n_zp_z+n_wp_w,
+\]
+and $m_\partial$ is a sum of $m$ independent indicators under the usual heuristic
+that the $\vct{w}_0$ coefficients are uniform and independent. The multiplicative
+Chernoff bound with $t=N_s+1$ gives
+\[
+\Pr[m_\partial>N_s]\;\leq\;\left(\frac{e\lambda}{t}\right)^t e^{-\lambda},
+\]
+and the exact convolution $\operatorname{Bin}(n_z,p_z)*\operatorname{Bin}(n_w,p_w)$
+is only a few bits tighter.
+
+\begin{center}
+\begin{tabular}{lccc}
+\hline
+ & MLDSA44 & MLDSA65 & MLDSA87\\\hline
+$\lambda$ & 2.9108 & 3.2632 & 2.7067\\
+Chernoff, $N_s=64$ & $2^{-201.7}$ & $2^{-191.5}$ & $2^{-208.2}$\\
+Exact, $N_s=64$ & $2^{-207.3}$ & $2^{-196.8}$ & $2^{-213.3}$\\\hline
+\end{tabular}
+\end{center}
+
+\textbf{Why the target is $2^{-196}$ and not $2^{-128}$.}
+Overflow discards the candidate before the challenge, but the surviving output
+distribution is $\Pr[\vct{z}=\vct{z}_0]\propto
+\one[\vct{z}_0\in B]\cdot\one[m_\partial(\vct{z}_0-c\vct{s})\leq N_s]$,
+which depends on $c\vct{s}$. The per-attempt statistical distance is at most
+$\Pr[\ovf]/\Pr[\mathrm{acc}]\leq2^{2.4}\Pr[\ovf]$, and a key signing $2^{64}$
+messages makes $Q\approx2^{66}$ attempts, so a lifetime bound of $2^{-128}$
+requires $\Pr[\ovf]\leq2^{-196}$. We instantiate $N_s=64$, which the exact tail
+certifies for all three parameter sets, with MLDSA65 the binding case at 0.8 bits
+of margin. Certifying the same claim from the Chernoff bound alone needs $N_s=68$
+there; $N_s=48$ supports only a per-attempt claim.
+\end{document}
